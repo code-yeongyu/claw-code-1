@@ -3615,7 +3615,18 @@ impl LiveCli {
             | SlashCommand::Tag { .. }
             | SlashCommand::OutputStyle { .. }
             | SlashCommand::AddDir { .. } => {
-                eprintln!("Command registered but not yet implemented.");
+                let name = match &command {
+                    SlashCommand::Color { .. } => "/color",
+                    SlashCommand::Effort { .. } => "/effort",
+                    SlashCommand::Branch { .. } => "/branch",
+                    SlashCommand::Rewind { .. } => "/rewind",
+                    SlashCommand::Ide { .. } => "/ide",
+                    SlashCommand::Tag { .. } => "/tag",
+                    SlashCommand::OutputStyle { .. } => "/output-style",
+                    SlashCommand::AddDir { .. } => "/add-dir",
+                    _ => "/unknown",
+                };
+                eprintln!("{name} is registered but not yet implemented.");
                 false
             }
             SlashCommand::Unknown(name) => {
