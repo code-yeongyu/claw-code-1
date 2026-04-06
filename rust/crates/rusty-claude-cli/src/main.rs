@@ -4994,7 +4994,7 @@ fn parse_opencode_jsonl_lane(
         .as_ref()
         .and_then(|value| value.get("title").and_then(Value::as_str));
     let activity = last_message.as_ref().and_then(extract_lane_activity_hint);
-    let phase = classify_lane_phase(blocker.as_deref(), title, activity.as_deref());
+    let phase = classify_lane_phase(blocker.as_deref(), title, activity.as_deref(), last_event_ms);
 
     Ok(Some(LaneRecord {
         session_id,
@@ -5051,7 +5051,7 @@ fn parse_opencode_storage_lane(
     Ok(Some(LaneRecord {
         session_id,
         branch: resolve_lane_branch(&worktree_path),
-        phase: classify_lane_phase(blocker.as_deref(), title, activity.as_deref()),
+        phase: classify_lane_phase(blocker.as_deref(), title, activity.as_deref(), last_event_ms),
         repo,
         worktree_path,
         last_event_ms,
@@ -5236,13 +5236,28 @@ fn extract_lane_activity_hint(value: &Value) -> Option<String> {
     }
 }
 
+/// Ten minutes without any session event → stalled.
+const STALL_THRESHOLD_MS: u64 = 10 * 60 * 1_000;
+
 fn classify_lane_phase(
     blocker: Option<&str>,
     title: Option<&str>,
     activity: Option<&str>,
+    last_event_ms: u64,
 ) -> String {
     if blocker.is_some() {
         return "blocked".to_string();
+    }
+
+    // Detect idle-without-progress (ROADMAP #35)
+    if last_event_ms > 0 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(last_event_ms);
+        if now_ms.saturating_sub(last_event_ms) >= STALL_THRESHOLD_MS {
+            return "stalled".to_string();
+        }
     }
 
     let context = [activity, title]
