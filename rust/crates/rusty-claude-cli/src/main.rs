@@ -2316,7 +2316,7 @@ fn format_auto_compaction_notice(removed: usize) -> String {
 }
 
 fn format_context_pressure_notice(utilization_pct: u8) -> String {
-    format!("WARN: context at {utilization_pct}% — consider claw compact before next turn")
+    format!("WARN: context at {utilization_pct}% — consider /compact in the REPL or start a new session")
 }
 
 fn context_pressure_notice(summary: &runtime::TurnSummary) -> Option<String> {
@@ -9706,7 +9706,7 @@ mod tests {
         let notice = super::format_context_pressure_notice(75);
         assert_eq!(
             notice,
-            "WARN: context at 75% — consider claw compact before next turn"
+            "WARN: context at 75% — consider /compact in the REPL or start a new session"
         );
     }
 
