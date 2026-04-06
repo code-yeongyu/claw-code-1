@@ -8145,7 +8145,8 @@ mod tests {
         render_diff_report_for, render_lanes_report, render_memory_report, render_repl_help,
         render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
-        check_workspace_health, status_json_value, LaneRecord,
+        classify_lane_phase, check_workspace_health, status_json_value, LaneRecord,
+        STALL_THRESHOLD_MS,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         DiagnosticLevel, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
@@ -9033,6 +9034,53 @@ mod tests {
         assert_eq!(json["lanes"][0]["blocker"], "blocked");
         assert!(message.contains("ses_live"));
         assert!(message.contains("phase=implementing"));
+    }
+
+    #[test]
+    fn classify_lane_phase_detects_stalled_sessions() {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_millis() as u64;
+
+        // Recent activity -> not stalled
+        assert_ne!(
+            classify_lane_phase(None, None, None, now_ms),
+            "stalled",
+        );
+        assert_ne!(
+            classify_lane_phase(None, None, None, now_ms - 1_000),
+            "stalled",
+        );
+
+        // 10+ minutes idle -> stalled
+        let stale_ms = now_ms - STALL_THRESHOLD_MS - 1;
+        assert_eq!(
+            classify_lane_phase(None, None, None, stale_ms),
+            "stalled",
+        );
+
+        // Blocked takes priority over stalled
+        assert_eq!(
+            classify_lane_phase(Some("missing dep"), None, None, stale_ms),
+            "blocked",
+        );
+
+        // Zero timestamp -> not stalled (guard for unknown)
+        assert_ne!(
+            classify_lane_phase(None, None, None, 0),
+            "stalled",
+        );
+
+        // Activity keywords still work for recent sessions
+        assert_eq!(
+            classify_lane_phase(None, Some("Plan next step"), None, now_ms),
+            "planning",
+        );
+        assert_eq!(
+            classify_lane_phase(None, None, Some("oracle review"), now_ms),
+            "verifying",
+        );
     }
 
     #[test]
