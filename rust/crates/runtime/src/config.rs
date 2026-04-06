@@ -1099,7 +1099,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("runtime-config-{nanos}"))
+        // Include thread id to avoid collisions between parallel tests on fast hardware
+        let thread_id = format!("{:?}", std::thread::current().id())
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>();
+        std::env::temp_dir().join(format!("runtime-config-{thread_id}-{nanos}"))
     }
 
     #[test]
