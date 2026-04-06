@@ -479,3 +479,13 @@ to:
   2. Add a compile-time or test-time assertion: every `SubcommandSpec` variant must appear in parse, REPL dispatch, help listing, and bare-command guidance
   3. Alternatively: a single `#[test]` that iterates known subcommands and asserts each one parses successfully in both `parse_args` and `try_parse_repl_subcommand`
 **Acceptance:** Adding a new subcommand that compiles but is missing from REPL dispatch causes a test failure.
+
+## #38 — `claw new` creates worktrees invisible to `claw lanes`
+**Status:** Backlog
+**Pinpoint:** `claw new fix/foo` creates a git worktree and prints success, but `claw lanes` only reads opencode session JSONL files — it has no awareness of worktrees without active sessions. An operator creates a lane, runs `claw lanes` to confirm, sees nothing. The two commands share no state.
+**Observed:** 2026-04-07, after `claw new` implementation. Worktree exists on disk but `claw lanes` returns empty.
+**Action:**
+  1. `claw lanes` should also scan for worktrees matching the `claw-worktree-*` naming pattern
+  2. Worktrees without active sessions should show `phase: pending` (created but no session started)
+  3. Alternatively, `claw new` should write a lightweight marker file that `claw lanes` can discover
+**Acceptance:** `claw new foo && claw lanes` shows the new lane with `phase: pending`.
