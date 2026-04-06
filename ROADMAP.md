@@ -406,3 +406,13 @@ to:
   2. Return `{ kind: "lanes", lanes: [{ session_id, repo, worktree_path, branch, phase, last_event_ms, blocker }] }` per lane
   3. Respond in <100ms without tmux/worktree scraping
 **Acceptance:** `claw lanes --output-format json` during a 4-session batch returns one entry per session with correct phase and a non-null `last_event_ms`.
+
+## #31 — Lane spawn wrapper hangs on second tmux create
+**Status:** Backlog
+**Pinpoint:** When launching multiple `claw-code-*` work lanes sequentially, the lane-spawn wrapper hangs after the first `tmux new-session` completes — the second invocation blocks indefinitely with no timeout, no error output, and no clear indication of what's stuck. Operators must kill the wrapper process manually and issue the second lane create separately.
+**Observed:** 2026-04-06, reproducible on back-to-back lane spawns against existing worktrees.
+**Action:**
+  1. Add a spawn timeout (e.g., 30s) to each tmux/worktree create step with a non-zero exit and clear error message on expiry
+  2. Add a pre-flight check: if the target branch/worktree already exists, skip creation and attach directly rather than erroring silently
+  3. Log each lane-spawn step to stderr in real time so operators can see where it stalled
+**Acceptance:** Spawning 3 lanes in sequence completes without manual intervention; stale-branch collision prints an actionable message instead of hanging.
