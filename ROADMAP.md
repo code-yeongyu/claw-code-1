@@ -416,3 +416,13 @@ to:
   2. Add a pre-flight check: if the target branch/worktree already exists, skip creation and attach directly rather than erroring silently
   3. Log each lane-spawn step to stderr in real time so operators can see where it stalled
 **Acceptance:** Spawning 3 lanes in sequence completes without manual intervention; stale-branch collision prints an actionable message instead of hanging.
+
+## #32 — No pre-flight branch audit surface
+**Status:** Backlog
+**Pinpoint:** There is no `claw` command to distinguish "this branch has unique commits not on main" from "this branch is stale pre-merge history". During lane cleanup, operators must run `git log branch ^main --oneline` per branch manually. With 10+ active lanes this becomes a real source of data loss — actual unmerged work gets mistakenly pruned alongside dead branches.
+**Observed:** 2026-04-06, during post-batch worktree reconciliation.
+**Action:**
+  1. Add `claw branches --status` that outputs per-branch: `{ branch, commits_ahead, last_commit_ms, merged_into_main: bool }`
+  2. Flag branches with `commits_ahead > 0 && !merged_into_main` as "live unmerged" in both text and JSON output
+  3. Optionally surface this in `claw lanes` so each lane entry includes `branch_status`
+**Acceptance:** `claw branches --status --output-format json` completes in <500ms and correctly identifies which branches carry unmerged code vs which are purely historical.
