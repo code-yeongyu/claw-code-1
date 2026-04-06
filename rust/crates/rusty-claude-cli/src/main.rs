@@ -8730,6 +8730,17 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&["new".to_string(), "fix/my-branch".to_string()]).expect("new should parse"),
+            CliAction::New {
+                branch: "fix/my-branch".to_string(),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert!(
+            parse_args(&["new".to_string()]).is_err(),
+            "new without branch should error"
+        );
+        assert_eq!(
             parse_args(&["agents".to_string()]).expect("agents should parse"),
             CliAction::Agents {
                 args: None,
