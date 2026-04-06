@@ -24,8 +24,7 @@ echo "--- cargo test --workspace ---"
 if (cd "$RUST_DIR" && cargo test --workspace); then
     echo "=== verify PASSED ==="
     exit 0
+else
+    echo "=== verify FAILED ===" >&2
+    exit 1
 fi
-
-status=$?
-echo "=== verify FAILED ===" >&2
-exit "$status"
