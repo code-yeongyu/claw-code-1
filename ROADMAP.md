@@ -372,3 +372,19 @@ to:
 - a **claw-native execution runtime**
 - an **event-native orchestration substrate**
 - a **plugin/hook-first autonomous coding harness**
+
+## #27 — Active lane/session visibility gap
+**Status:** Backlog
+**Pinpoint:** To answer "what's active/blocked/cleanable", operator must scrape tmux + enumerate worktrees + inspect ROADMAP text. No single machine-readable lane board exists.
+**Action:** Expose one machine-readable lane inventory endpoint/command:
+  `claw lanes` → JSON array of `{ session_id, repo, worktree_path, branch, phase: exploring|planning|implementing|verifying|blocked, last_event_ms, blocker: string|null }`
+**Acceptance:** `claw lanes --output-format json` returns current lane state in <100ms without requiring tmux or worktree enumeration.
+
+## #28 — Workspace test discoverability gap
+**Status:** Backlog
+**Pinpoint:** `cargo test --workspace --manifest-path rust/Cargo.toml` silently skips the repo-root `tests/` integration suite, making "workspace green" ambiguous. Operators running from wrong directory see 0 tests pass and think it's green.
+**Action:** Define one canonical repo-level verification entrypoint (e.g., `just test` or `scripts/verify.sh`) that:
+  1. Runs from repo root
+  2. Includes integration suite
+  3. Fails loud if integration tests are missing or skipped
+**Acceptance:** Running the canonical command from any directory produces identical results; missing integration suite causes non-zero exit.
