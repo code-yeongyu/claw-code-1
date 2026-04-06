@@ -459,3 +459,13 @@ to:
   3. Optionally emit a `LaneEvent::StallDetected { idle_ms }` into the session JSONL
   4. CLI should print `WARN: session <id> has been idle for Xm — consider inspecting or restarting`
 **Acceptance:** After 10min idle with no file edits, `claw lanes` shows `phase: stalled` and CLI emits a warning.
+
+## #36 — No native push/delegation primitive for read-only agents
+**Status:** Backlog
+**Pinpoint:** Agents with local commit access but HTTP 403 on push have no `claw` primitive to hand off work upstream. Current workaround: git bundle + scp over Tailscale + manual relay by a privileged operator. This adds 5–30min latency to every dogfood cycle and creates merge debt accumulation.
+**Observed:** 2026-04-06, Jobdori accumulated 15 local commits over ~3 hours that could not reach upstream without manual relay.
+**Action:**
+  1. Add `claw push-request` command: packages local commits not on `origin/main` as a bundle + opens a PR or posts the bundle URL to a configured channel
+  2. OR: Add a `claw relay --to <agent-id>` that sends the local bundle to a privileged agent via Agentika topic for auto-push
+  3. The receiving agent validates (build + test) then pushes
+**Acceptance:** A read-only agent can run `claw push-request` and have commits reach upstream within 5 minutes without human intervention.
