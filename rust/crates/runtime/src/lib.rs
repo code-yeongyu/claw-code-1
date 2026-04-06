@@ -16,6 +16,7 @@ mod file_ops;
 pub mod green_contract;
 mod hooks;
 mod json;
+mod lane_spawn;
 mod lane_events;
 pub mod lsp_client;
 mod mcp;
@@ -74,6 +75,11 @@ pub use file_ops::{
 pub use green_contract::GreenLevel;
 pub use hooks::{
     HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
+};
+pub use lane_spawn::{
+    lane_spawn_request_from_packet, spawn_lane_from_packet, spawn_lane_with_runner,
+    LaneSpawnCommandOutput, LaneSpawnCommandRunner, LaneSpawnCommandSpec, LaneSpawnMode,
+    LaneSpawnRequest, LaneSpawnResult, LaneSpawnTransport, DEFAULT_LANE_SPAWN_TIMEOUT,
 };
 pub use lane_events::{
     dedupe_superseded_commit_events, FailureClass, LaneCommitProvenance, LaneEvent,

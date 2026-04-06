@@ -45,14 +45,15 @@ use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     check_freshness, clear_oauth_credentials, current_branch_cwd, derive_actionable_summary,
     format_usd, generate_pkce_pair, generate_state, load_oauth_credentials,
-    load_system_prompt, parse_oauth_callback_request_target, pricing_for_model,
-    resolve_main_ref_cwd, resolve_sandbox_status, save_oauth_credentials,
-    task_registry::TaskRegistry, validate_packet, ActionableSummary, ApiClient, ApiRequest,
-    AssistantEvent, BranchFreshness, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, McpServerManager, McpTool, MessageRole,
-    ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
-    PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
-    RuntimeError, Session, TaskPacket, TokenUsage, ToolError, ToolExecutor, UsageTracker, Worker,
+    lane_spawn_request_from_packet, load_system_prompt, parse_oauth_callback_request_target,
+    pricing_for_model, resolve_main_ref_cwd, resolve_sandbox_status, save_oauth_credentials,
+    spawn_lane_from_packet, task_registry::TaskRegistry, validate_packet, ActionableSummary,
+    ApiClient, ApiRequest, AssistantEvent, BranchFreshness, CompactionConfig, ConfigLoader,
+    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, LaneSpawnTransport,
+    McpServerManager, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
+    OAuthConfig, OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext,
+    PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TaskPacket, TokenUsage,
+    ToolError, ToolExecutor, UsageTracker, Worker,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -291,6 +292,13 @@ enum TaskCliAction {
 enum CliOutputFormat {
     Text,
     Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskCreateTransportMode {
+    Tmux,
+    InProcess,
+    Auto,
 }
 
 impl CliOutputFormat {
@@ -5276,7 +5284,7 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
             .to_string(),
         LocalHelpTopic::TaskCreate => "Task Create
   Usage            claw task create --from-json <path|->
-  Purpose          read a typed task packet from JSON and register a task in-process
+  Purpose          read a typed task packet from JSON, prepare the lane worktree, and spawn or reuse the lane transport
   Output           text summary or JSON envelope with kind=task_create"
             .to_string(),
         LocalHelpTopic::TaskValidate => "Task Validate
@@ -5327,12 +5335,38 @@ fn run_task_create_command(
     source: &str,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
     let packet = read_task_packet_source(source)?;
     let task = cli_task_registry().create_from_packet(packet.clone())?;
+    let transport = resolve_task_create_transport_mode(&cwd);
+    let lane_spawn = spawn_lane_from_packet(
+        &packet,
+        &cwd,
+        transport,
+        &mut |message| eprintln!("{message}"),
+    )?;
     let message = format!("created {} from {}", task.task_id, source_label(source));
 
     match output_format {
-        CliOutputFormat::Text => println!("{message}"),
+        CliOutputFormat::Text => println!(
+            "Task created
+  Task id           {}
+  Source            {}
+  Lane result       {:?}
+  Transport         {}
+  Repo              {}
+  Branch            {}
+  Worktree          {}
+  Session           {}",
+            task.task_id,
+            source_label(source),
+            lane_spawn.mode,
+            render_task_create_transport(lane_spawn.transport),
+            lane_spawn.repo.display(),
+            lane_spawn.branch,
+            lane_spawn.worktree.display(),
+            lane_spawn.session_name.as_deref().unwrap_or("(in-process)")
+        ),
         CliOutputFormat::Json => println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -5341,6 +5375,7 @@ fn run_task_create_command(
                 "task_id": task.task_id,
                 "status": task.status,
                 "task_packet": packet,
+                "lane_spawn": lane_spawn,
             }))?
         ),
     }
@@ -5387,6 +5422,56 @@ fn source_label(source: &str) -> &str {
         "stdin"
     } else {
         source
+    }
+}
+
+fn resolve_task_create_transport_mode(cwd: &Path) -> LaneSpawnTransport {
+    match load_task_create_transport_mode(cwd) {
+        TaskCreateTransportMode::Tmux => LaneSpawnTransport::Tmux,
+        TaskCreateTransportMode::InProcess => LaneSpawnTransport::InProcess,
+        TaskCreateTransportMode::Auto => {
+            if command_exists("tmux") {
+                LaneSpawnTransport::Tmux
+            } else {
+                LaneSpawnTransport::InProcess
+            }
+        }
+    }
+}
+
+fn load_task_create_transport_mode(cwd: &Path) -> TaskCreateTransportMode {
+    if let Ok(value) = env::var("CLAW_TEAMMATE_MODE") {
+        if let Some(mode) = parse_task_create_transport_mode(&value) {
+            return mode;
+        }
+    }
+
+    ConfigLoader::default_for(cwd)
+        .load()
+        .ok()
+        .and_then(|config| {
+            config
+                .get("teammateMode")
+                .and_then(|value| value.as_str().map(str::to_string))
+        })
+        .as_deref()
+        .and_then(parse_task_create_transport_mode)
+        .unwrap_or(TaskCreateTransportMode::Auto)
+}
+
+fn parse_task_create_transport_mode(value: &str) -> Option<TaskCreateTransportMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "tmux" => Some(TaskCreateTransportMode::Tmux),
+        "in-process" => Some(TaskCreateTransportMode::InProcess),
+        "auto" => Some(TaskCreateTransportMode::Auto),
+        _ => None,
+    }
+}
+
+const fn render_task_create_transport(transport: LaneSpawnTransport) -> &'static str {
+    match transport {
+        LaneSpawnTransport::Tmux => "tmux",
+        LaneSpawnTransport::InProcess => "in_process",
     }
 }
 

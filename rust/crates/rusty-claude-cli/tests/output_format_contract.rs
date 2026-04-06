@@ -89,7 +89,10 @@ fn standalone_status_reads_worker_snapshots_from_latest_managed_session() {
     assert_eq!(status["workers"]["source"], "latest_managed_session");
     assert_eq!(
         status["workers"]["session"],
-        std::fs::canonicalize(&session_path).unwrap_or(session_path.clone()).display().to_string()
+        std::fs::canonicalize(&session_path)
+            .unwrap_or(session_path.clone())
+            .display()
+            .to_string()
     );
     assert_eq!(status["workers"]["count"], 1);
     assert_eq!(
@@ -461,15 +464,16 @@ fn resumed_version_and_init_emit_structured_json_when_requested() {
 fn task_commands_emit_structured_json_when_requested() {
     let root = unique_temp_dir("task-json");
     fs::create_dir_all(&root).expect("temp dir should exist");
+    init_git_repo(&root.join("repo"));
 
     let packet_path = root.join("packet.json");
     fs::write(
         &packet_path,
-        sample_task_packet_json(root.join("repo"), root.join("worktree")),
+        sample_task_packet_json(root.join("repo"), root.join("repo/.worktrees/worktree")),
     )
     .expect("packet should write");
 
-    let create = assert_json_command(
+    let create = assert_json_command_with_env(
         &root,
         &[
             "--output-format",
@@ -479,6 +483,7 @@ fn task_commands_emit_structured_json_when_requested() {
             "--from-json",
             packet_path.to_str().expect("utf8 packet path"),
         ],
+        &[("CLAW_TEAMMATE_MODE", "in-process")],
     );
     assert_eq!(create["kind"], "task_create");
     assert_eq!(create["status"], "created");
@@ -486,6 +491,12 @@ fn task_commands_emit_structured_json_when_requested() {
     assert_eq!(
         create["task_packet"]["repo"],
         root.join("repo").display().to_string()
+    );
+    assert_eq!(create["lane_spawn"]["transport"], "in_process");
+    assert_eq!(create["lane_spawn"]["branch"], "worktree");
+    assert_eq!(
+        create["lane_spawn"]["worktree"],
+        root.join("repo/.worktrees/worktree").display().to_string()
     );
 
     let validate = assert_json_command_with_input(
@@ -583,6 +594,31 @@ fn sample_task_packet_json(repo: PathBuf, worktree: PathBuf) -> String {
         "escalation_policy": "alert_human"
     })
     .to_string()
+}
+
+fn init_git_repo(root: &Path) {
+    fs::create_dir_all(root).expect("repo dir should exist");
+    run_git(root, &["init", "--quiet", "-b", "main"]);
+    run_git(root, &["config", "user.email", "tests@example.com"]);
+    run_git(root, &["config", "user.name", "Task JSON Tests"]);
+    fs::write(root.join("README.md"), "seed\n").expect("seed file should write");
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-m", "seed", "--quiet"]);
+}
+
+fn run_git(current_dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(current_dir)
+        .args(args)
+        .output()
+        .expect("git should launch");
+    assert!(
+        output.status.success(),
+        "git {:?} failed\nstdout:\n{}\n\nstderr:\n{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn write_upstream_fixture(root: &Path) -> PathBuf {
