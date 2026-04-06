@@ -408,7 +408,7 @@ to:
 **Acceptance:** `claw lanes --output-format json` during a 4-session batch returns one entry per session with correct phase and a non-null `last_event_ms`.
 
 ## #31 — Lane spawn wrapper hangs on second tmux create
-**Status:** Backlog
+**Status:** Done — `a3c643b` (`claw new <branch>` with 30s timeout, stale-branch attach-instead, REPL dispatch `50afdf9`)
 **Pinpoint:** When launching multiple `claw-code-*` work lanes sequentially, the lane-spawn wrapper hangs after the first `tmux new-session` completes — the second invocation blocks indefinitely with no timeout, no error output, and no clear indication of what's stuck. Operators must kill the wrapper process manually and issue the second lane create separately.
 **Observed:** 2026-04-06, reproducible on back-to-back lane spawns against existing worktrees.
 **Action:**
