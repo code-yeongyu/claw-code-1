@@ -584,6 +584,14 @@ fn parse_single_word_command_alias(
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
         "lanes" => Some(Ok(CliAction::Lanes { output_format })),
+        "new" => {
+            let branch = rest.get(1).cloned().unwrap_or_default();
+            if branch.trim().is_empty() {
+                Some(Err("new subcommand requires a branch name".to_string()))
+            } else {
+                Some(Ok(CliAction::New { branch, output_format }))
+            }
+        }
         other => bare_slash_command_guidance(other).map(Err),
     }
 }
