@@ -10,7 +10,7 @@ mod init;
 mod input;
 mod render;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -42,18 +42,23 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    clear_oauth_credentials, format_usd, generate_pkce_pair, generate_state,
-    load_oauth_credentials, load_system_prompt, parse_oauth_callback_request_target,
-    pricing_for_model, resolve_sandbox_status, save_oauth_credentials, ApiClient, ApiRequest,
-    AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, McpServerManager, McpTool, MessageRole, ModelPricing,
-    OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PermissionMode,
-    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
-    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    check_freshness, clear_oauth_credentials, current_branch_cwd, derive_actionable_summary,
+    format_usd, generate_pkce_pair, generate_state, load_oauth_credentials,
+    load_system_prompt, parse_oauth_callback_request_target, pricing_for_model,
+    resolve_main_ref_cwd, resolve_sandbox_status, save_oauth_credentials,
+    task_registry::TaskRegistry, validate_packet, ActionableSummary, ApiClient, ApiRequest,
+    AssistantEvent, BranchFreshness, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, McpServerManager, McpTool, MessageRole,
+    ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
+    PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
+    RuntimeError, Session, TaskPacket, TokenUsage, ToolError, ToolExecutor, UsageTracker, Worker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
+use tools::{
+    load_agent_manifest_from_tool_output, GlobalToolRegistry, RuntimeToolDefinition,
+    ToolSearchOutput,
+};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -162,6 +167,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Logout { output_format } => run_logout(output_format)?,
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
+        CliAction::Task { action } => run_task_command(action)?,
         CliAction::Repl {
             model,
             allowed_tools,
@@ -238,6 +244,9 @@ enum CliAction {
     Init {
         output_format: CliOutputFormat,
     },
+    Task {
+        action: TaskCliAction,
+    },
     Repl {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
@@ -255,6 +264,21 @@ enum LocalHelpTopic {
     Status,
     Sandbox,
     Doctor,
+    Task,
+    TaskCreate,
+    TaskValidate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TaskCliAction {
+    Create {
+        source: String,
+        output_format: CliOutputFormat,
+    },
+    Validate {
+        source: String,
+        output_format: CliOutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,6 +470,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }),
             }
         }
+        "task" => parse_task_args(&rest[1..], output_format),
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
         "login" => Ok(CliAction::Login { output_format }),
         "logout" => Ok(CliAction::Logout { output_format }),
@@ -481,17 +506,27 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 }
 
 fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>> {
-    if rest.len() != 2 || !is_help_flag(&rest[1]) {
-        return None;
+    match rest {
+        [command, flag] if is_help_flag(flag) => {
+            let topic = match command.as_str() {
+                "status" => LocalHelpTopic::Status,
+                "sandbox" => LocalHelpTopic::Sandbox,
+                "doctor" => LocalHelpTopic::Doctor,
+                "task" => LocalHelpTopic::Task,
+                _ => return None,
+            };
+            Some(Ok(CliAction::HelpTopic(topic)))
+        }
+        [command, subcommand, flag] if command == "task" && is_help_flag(flag) => {
+            let topic = match subcommand.as_str() {
+                "create" => LocalHelpTopic::TaskCreate,
+                "validate" => LocalHelpTopic::TaskValidate,
+                _ => return Some(Err(format!("unknown task subcommand: {subcommand}"))),
+            };
+            Some(Ok(CliAction::HelpTopic(topic)))
+        }
+        _ => None,
     }
-
-    let topic = match rest[0].as_str() {
-        "status" => LocalHelpTopic::Status,
-        "sandbox" => LocalHelpTopic::Sandbox,
-        "doctor" => LocalHelpTopic::Doctor,
-        _ => return None,
-    };
-    Some(Ok(CliAction::HelpTopic(topic)))
 }
 
 fn is_help_flag(value: &str) -> bool {
@@ -557,6 +592,38 @@ fn join_optional_args(args: &[String]) -> Option<String> {
     let joined = args.join(" ");
     let trimmed = joined.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn parse_task_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+    match args {
+        [subcommand, flag, source] if subcommand == "create" && flag == "--from-json" => {
+            Ok(CliAction::Task {
+                action: TaskCliAction::Create {
+                    source: source.clone(),
+                    output_format,
+                },
+            })
+        }
+        [subcommand, source] if subcommand == "validate" => Ok(CliAction::Task {
+            action: TaskCliAction::Validate {
+                source: source.clone(),
+                output_format,
+            },
+        }),
+        [] => Err("task requires a subcommand. Use `claw task --help` for usage.".to_string()),
+        [subcommand] => match subcommand.as_str() {
+            "create" => Err("task create requires --from-json <path|->".to_string()),
+            "validate" => Err("task validate requires <path|->".to_string()),
+            _ => Err(format!("unknown task subcommand: {subcommand}")),
+        },
+        [subcommand, ..] if subcommand == "create" => {
+            Err("task create only supports --from-json <path|->".to_string())
+        }
+        [subcommand, ..] if subcommand == "validate" => {
+            Err("task validate only accepts <path|->".to_string())
+        }
+        [subcommand, ..] => Err(format!("unknown task subcommand: {subcommand}")),
+    }
 }
 
 fn parse_direct_slash_cli_action(
@@ -928,6 +995,7 @@ struct DiagnosticCheck {
     level: DiagnosticLevel,
     summary: String,
     details: Vec<String>,
+    failure_class: Option<runtime::FailureClass>,
     data: Map<String, Value>,
 }
 
@@ -938,6 +1006,7 @@ impl DiagnosticCheck {
             level,
             summary: summary.into(),
             details: Vec::new(),
+            failure_class: None,
             data: Map::new(),
         }
     }
@@ -949,6 +1018,11 @@ impl DiagnosticCheck {
 
     fn with_data(mut self, data: Map<String, Value>) -> Self {
         self.data = data;
+        self
+    }
+
+    fn with_failure_class(mut self, failure_class: runtime::FailureClass) -> Self {
+        self.failure_class = Some(failure_class);
         self
     }
 
@@ -974,6 +1048,12 @@ impl DiagnosticCheck {
                 ),
             ),
         ]);
+        if let Some(failure_class) = self.failure_class {
+            value.insert(
+                "failure_class".to_string(),
+                serde_json::to_value(failure_class).expect("failure class should serialize"),
+            );
+        }
         value.extend(self.data.clone());
         Value::Object(value)
     }
@@ -1066,6 +1146,8 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
     let empty_config = runtime::RuntimeConfig::empty();
     let sandbox_config = config.as_ref().ok().unwrap_or(&empty_config);
+    let (stale_against_main, missing_commits_count) =
+        compute_stale_branch_fields(git_branch.as_deref());
     let context = StatusContext {
         cwd: cwd.clone(),
         session_path: None,
@@ -1079,6 +1161,8 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
         git_branch,
         git_summary,
         sandbox_status: resolve_sandbox_status(sandbox_config.sandbox(), &cwd),
+        stale_against_main,
+        missing_commits_count,
     };
     Ok(DoctorReport {
         checks: vec![
@@ -1170,6 +1254,7 @@ fn check_auth_health() -> DiagnosticCheck {
                     "saved OAuth credentials are available"
                 },
             )
+            .with_failure_class(runtime::FailureClass::GatewayRouting)
             .with_details(details)
             .with_data(Map::from_iter([
                 ("api_key_present".to_string(), json!(api_key_present)),
@@ -1200,6 +1285,7 @@ fn check_auth_health() -> DiagnosticCheck {
                 "no API key or saved OAuth credentials were found"
             },
         )
+        .with_failure_class(runtime::FailureClass::GatewayRouting)
         .with_details(vec![format!(
             "Environment       api_key={} auth_token={}",
             if api_key_present { "present" } else { "absent" },
@@ -1223,6 +1309,7 @@ fn check_auth_health() -> DiagnosticCheck {
             DiagnosticLevel::Fail,
             format!("failed to inspect saved credentials: {error}"),
         )
+        .with_failure_class(runtime::FailureClass::GatewayRouting)
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
@@ -1306,6 +1393,7 @@ fn check_config_health(
             DiagnosticLevel::Fail,
             format!("runtime config failed to load: {error}"),
         )
+        .with_failure_class(runtime::FailureClass::Infra)
         .with_details(if discovered_paths.is_empty() {
             vec!["Discovered files  <none>".to_string()]
         } else {
@@ -1330,23 +1418,28 @@ fn check_config_health(
 
 fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
     let in_repo = context.project_root.is_some();
-    DiagnosticCheck::new(
-        "Workspace",
-        if in_repo {
-            DiagnosticLevel::Ok
-        } else {
-            DiagnosticLevel::Warn
-        },
-        if in_repo {
-            format!(
-                "project root detected on branch {}",
-                context.git_branch.as_deref().unwrap_or("unknown")
-            )
-        } else {
-            "current directory is not inside a git project".to_string()
-        },
-    )
-    .with_details(vec![
+    let level = if !in_repo {
+        DiagnosticLevel::Warn
+    } else if context.stale_against_main {
+        DiagnosticLevel::Warn
+    } else {
+        DiagnosticLevel::Ok
+    };
+    let summary = if !in_repo {
+        "current directory is not inside a git project".to_string()
+    } else if context.stale_against_main {
+        format!(
+            "branch {} is {} commit(s) behind main",
+            context.git_branch.as_deref().unwrap_or("unknown"),
+            context.missing_commits_count,
+        )
+    } else {
+        format!(
+            "project root detected on branch {}",
+            context.git_branch.as_deref().unwrap_or("unknown")
+        )
+    };
+    let mut details = vec![
         format!("Cwd              {}", context.cwd.display()),
         format!(
             "Project root     {}",
@@ -1365,39 +1458,56 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
             "Memory files     {} · config files loaded {}/{}",
             context.memory_file_count, context.loaded_config_files, context.discovered_config_files
         ),
-    ])
-    .with_data(Map::from_iter([
-        ("cwd".to_string(), json!(context.cwd.display().to_string())),
-        (
-            "project_root".to_string(),
-            json!(context
-                .project_root
-                .as_ref()
-                .map(|path| path.display().to_string())),
-        ),
-        ("in_git_repo".to_string(), json!(in_repo)),
-        ("git_branch".to_string(), json!(context.git_branch)),
-        (
-            "git_state".to_string(),
-            json!(context.git_summary.headline()),
-        ),
-        (
-            "changed_files".to_string(),
-            json!(context.git_summary.changed_files),
-        ),
-        (
-            "memory_file_count".to_string(),
-            json!(context.memory_file_count),
-        ),
-        (
-            "loaded_config_files".to_string(),
-            json!(context.loaded_config_files),
-        ),
-        (
-            "discovered_config_files".to_string(),
-            json!(context.discovered_config_files),
-        ),
-    ]))
+        format!("Stale vs main    {}", context.stale_against_main),
+        format!("Missing commits  {}", context.missing_commits_count),
+    ];
+    if context.stale_against_main {
+        details.push(
+            "Suggested action merge or rebase main before workspace tests".to_string(),
+        );
+    }
+    DiagnosticCheck::new("Workspace", level, summary)
+        .with_details(details)
+        .with_data(Map::from_iter([
+            ("cwd".to_string(), json!(context.cwd.display().to_string())),
+            (
+                "project_root".to_string(),
+                json!(context
+                    .project_root
+                    .as_ref()
+                    .map(|path| path.display().to_string())),
+            ),
+            ("in_git_repo".to_string(), json!(in_repo)),
+            ("git_branch".to_string(), json!(context.git_branch)),
+            (
+                "git_state".to_string(),
+                json!(context.git_summary.headline()),
+            ),
+            (
+                "changed_files".to_string(),
+                json!(context.git_summary.changed_files),
+            ),
+            (
+                "memory_file_count".to_string(),
+                json!(context.memory_file_count),
+            ),
+            (
+                "loaded_config_files".to_string(),
+                json!(context.loaded_config_files),
+            ),
+            (
+                "discovered_config_files".to_string(),
+                json!(context.discovered_config_files),
+            ),
+            (
+                "stale_against_main".to_string(),
+                json!(context.stale_against_main),
+            ),
+            (
+                "missing_commits_count".to_string(),
+                json!(context.missing_commits_count),
+            ),
+        ]))
 }
 
 fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
@@ -1877,6 +1987,8 @@ struct StatusContext {
     git_branch: Option<String>,
     git_summary: GitWorkspaceSummary,
     sandbox_status: runtime::SandboxStatus,
+    stale_against_main: bool,
+    missing_commits_count: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1886,6 +1998,54 @@ struct StatusUsage {
     latest: TokenUsage,
     cumulative: TokenUsage,
     estimated_tokens: usize,
+}
+
+#[derive(Debug, Clone)]
+struct StatusWorkersSnapshot {
+    source: String,
+    session_path: Option<PathBuf>,
+    load_error: Option<String>,
+    items: Vec<Worker>,
+}
+
+impl StatusWorkersSnapshot {
+    fn empty(source: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            session_path: None,
+            load_error: None,
+            items: Vec::new(),
+        }
+    }
+
+    fn json_value(&self) -> serde_json::Value {
+        let items = self
+            .items
+            .iter()
+            .map(|worker| {
+                json!({
+                    "worker_id": worker.worker_id,
+                    "cwd": worker.cwd,
+                    "status": worker.status,
+                    "lifecycle_state": worker.lifecycle_state(),
+                    "blocked": worker.is_blocked(),
+                    "prompt_in_flight": worker.prompt_in_flight,
+                    "prompt_delivery_attempts": worker.prompt_delivery_attempts,
+                    "trust_gate_cleared": worker.trust_gate_cleared,
+                    "last_error": worker.last_error,
+                    "latest_event": worker.events.last(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        json!({
+            "source": self.source,
+            "session": self.session_path.as_ref().map(|path| path.display().to_string()),
+            "count": items.len(),
+            "load_error": self.load_error,
+            "items": items,
+        })
+    }
 }
 
 #[allow(clippy::struct_field_names)]
@@ -2252,6 +2412,11 @@ fn run_resume_command(
             let tracker = UsageTracker::from_session(session);
             let usage = tracker.cumulative_usage();
             let context = status_context(Some(session_path))?;
+            let workers = status_workers_from_session(
+                session,
+                Some(session_path.to_path_buf()),
+                "resumed_session",
+            );
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format_status_report(
@@ -2277,6 +2442,7 @@ fn run_resume_command(
                     },
                     default_permission_mode().as_str(),
                     &context,
+                    &workers,
                 )),
             })
         }
@@ -4158,6 +4324,7 @@ fn print_status_snapshot(
         estimated_tokens: 0,
     };
     let context = status_context(None)?;
+    let workers = load_status_workers_for_snapshot()?;
     match output_format {
         CliOutputFormat::Text => println!(
             "{}",
@@ -4170,6 +4337,7 @@ fn print_status_snapshot(
                 usage,
                 permission_mode.as_str(),
                 &context,
+                &workers,
             ))?
         ),
     }
@@ -4181,6 +4349,7 @@ fn status_json_value(
     usage: StatusUsage,
     permission_mode: &str,
     context: &StatusContext,
+    workers: &StatusWorkersSnapshot,
 ) -> serde_json::Value {
     json!({
         "kind": "status",
@@ -4208,6 +4377,8 @@ fn status_json_value(
             "loaded_config_files": context.loaded_config_files,
             "discovered_config_files": context.discovered_config_files,
             "memory_file_count": context.memory_file_count,
+            "stale_against_main": context.stale_against_main,
+            "missing_commits_count": context.missing_commits_count,
         },
         "sandbox": {
             "enabled": context.sandbox_status.enabled,
@@ -4223,7 +4394,8 @@ fn status_json_value(
             "allowed_mounts": context.sandbox_status.allowed_mounts,
             "markers": context.sandbox_status.container_markers,
             "fallback_reason": context.sandbox_status.fallback_reason,
-        }
+        },
+        "workers": workers.json_value(),
     })
 }
 
@@ -4239,6 +4411,8 @@ fn status_context(
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
     let sandbox_status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
+    let (stale_against_main, missing_commits_count) =
+        compute_stale_branch_fields(git_branch.as_deref());
     Ok(StatusContext {
         cwd,
         session_path: session_path.map(Path::to_path_buf),
@@ -4249,8 +4423,115 @@ fn status_context(
         git_branch,
         git_summary,
         sandbox_status,
+        stale_against_main,
+        missing_commits_count,
     })
 }
+
+fn compute_stale_branch_fields(git_branch: Option<&str>) -> (bool, usize) {
+    let branch = match git_branch {
+        Some(b) if !b.is_empty() => b.to_string(),
+        _ => match current_branch_cwd() {
+            Some(detected) => detected,
+            None => return (false, 0),
+        },
+    };
+    let main_ref = match resolve_main_ref_cwd(&branch) {
+        Some(r) => r,
+        None => return (false, 0),
+    };
+    match check_freshness(&branch, &main_ref) {
+        BranchFreshness::Fresh => (false, 0),
+        BranchFreshness::Stale {
+            commits_behind, ..
+        } => (true, commits_behind),
+        BranchFreshness::Diverged { behind, .. } => (true, behind),
+    }
+}
+
+fn load_status_workers_for_snapshot() -> Result<StatusWorkersSnapshot, Box<dyn std::error::Error>> {
+    match latest_managed_session() {
+        Ok(handle) => match Session::load_from_path(&handle.path) {
+            Ok(session) => Ok(status_workers_from_session(
+                &session,
+                Some(handle.path),
+                "latest_managed_session",
+            )),
+            Err(error) => Ok(StatusWorkersSnapshot {
+                source: "latest_managed_session".to_string(),
+                session_path: Some(handle.path),
+                load_error: Some(error.to_string()),
+                items: Vec::new(),
+            }),
+        },
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("no managed sessions found") {
+                Ok(StatusWorkersSnapshot::empty("none"))
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn status_workers_from_session(
+    session: &Session,
+    session_path: Option<PathBuf>,
+    source: &str,
+) -> StatusWorkersSnapshot {
+    StatusWorkersSnapshot {
+        source: source.to_string(),
+        session_path,
+        load_error: None,
+        items: workers_from_session(session),
+    }
+}
+
+fn workers_from_session(session: &Session) -> Vec<Worker> {
+    let mut workers = BTreeMap::new();
+
+    for message in &session.messages {
+        for block in &message.blocks {
+            let ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error,
+                ..
+            } = block
+            else {
+                continue;
+            };
+
+            if *is_error || !is_worker_snapshot_tool(tool_name) {
+                continue;
+            }
+
+            let Ok(worker) = serde_json::from_str::<Worker>(output) else {
+                continue;
+            };
+
+            workers.insert(worker.worker_id.clone(), worker);
+        }
+    }
+
+    workers.into_values().collect()
+}
+
+fn is_worker_snapshot_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "WorkerCreate"
+            | "WorkerGet"
+            | "WorkerObserve"
+            | "WorkerResolveTrust"
+            | "WorkerSendPrompt"
+            | "WorkerRestart"
+            | "WorkerTerminate"
+    )
+}
+
+
 
 fn format_status_report(
     model: &str,
@@ -4292,6 +4573,8 @@ fn format_status_report(
   Session          {}
   Config files     loaded {}/{}
   Memory files     {}
+  Stale vs main    {}
+  Missing commits  {}
   Suggested flow   /status → /diff → /commit",
             context.cwd.display(),
             context
@@ -4311,6 +4594,8 @@ fn format_status_report(
             context.loaded_config_files,
             context.discovered_config_files,
             context.memory_file_count,
+            context.stale_against_main,
+            context.missing_commits_count,
         ),
         format_sandbox_report(&context.sandbox_status),
     ]
@@ -4445,11 +4730,113 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Output           local-only health report; no provider request or session resume required
   Related          /doctor · claw --resume latest /doctor"
             .to_string(),
+        LocalHelpTopic::Task => "Task
+  Usage            claw task <create|validate> ...
+  Purpose          create or validate typed task packets locally
+  Related          claw task create --help · claw task validate --help"
+            .to_string(),
+        LocalHelpTopic::TaskCreate => "Task Create
+  Usage            claw task create --from-json <path|->
+  Purpose          read a typed task packet from JSON and register a task in-process
+  Output           text summary or JSON envelope with kind=task_create"
+            .to_string(),
+        LocalHelpTopic::TaskValidate => "Task Validate
+  Usage            claw task validate <path|->
+  Purpose          validate a typed task packet from JSON without creating a task
+  Output           text summary or JSON envelope with kind=task_validate"
+            .to_string(),
     }
 }
 
 fn print_help_topic(topic: LocalHelpTopic) {
     println!("{}", render_help_topic(topic));
+}
+
+fn cli_task_registry() -> &'static TaskRegistry {
+    use std::sync::OnceLock;
+
+    static REGISTRY: OnceLock<TaskRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(TaskRegistry::new)
+}
+
+fn run_task_command(action: TaskCliAction) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        TaskCliAction::Create {
+            source,
+            output_format,
+        } => run_task_create_command(&source, output_format),
+        TaskCliAction::Validate {
+            source,
+            output_format,
+        } => run_task_validate_command(&source, output_format),
+    }
+}
+
+fn run_task_create_command(
+    source: &str,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let packet = read_task_packet_source(source)?;
+    let task = cli_task_registry().create_from_packet(packet.clone())?;
+    let message = format!("created {} from {}", task.task_id, source_label(source));
+
+    match output_format {
+        CliOutputFormat::Text => println!("{message}"),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "task_create",
+                "message": message,
+                "task_id": task.task_id,
+                "status": task.status,
+                "task_packet": packet,
+            }))?
+        ),
+    }
+    Ok(())
+}
+
+fn run_task_validate_command(
+    source: &str,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let packet = read_task_packet_source(source)?;
+    let validated = validate_packet(packet.clone())?;
+    let message = format!("valid {}", source_label(source));
+
+    match output_format {
+        CliOutputFormat::Text => println!("{message}"),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "task_validate",
+                "message": message,
+                "valid": true,
+                "errors": Vec::<String>::new(),
+                "task_packet": validated.into_inner(),
+            }))?
+        ),
+    }
+    Ok(())
+}
+
+fn read_task_packet_source(source: &str) -> Result<TaskPacket, Box<dyn std::error::Error>> {
+    let raw = if source == "-" {
+        let mut buffer = String::new();
+        io::stdin().read_to_string(&mut buffer)?;
+        buffer
+    } else {
+        fs::read_to_string(source)?
+    };
+    Ok(serde_json::from_str(&raw)?)
+}
+
+fn source_label(source: &str) -> &str {
+    if source == "-" {
+        "stdin"
+    } else {
+        source
+    }
 }
 
 fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
@@ -5658,6 +6045,7 @@ impl ApiClient for AnthropicRuntimeClient {
                     .await
                     .map_err(|error| {
                         RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                            .with_failure_class(error.to_failure_class())
                     })?;
             let mut stdout = io::stdout();
             let mut sink = io::sink();
@@ -5675,6 +6063,7 @@ impl ApiClient for AnthropicRuntimeClient {
 
             while let Some(event) = stream.next_event().await.map_err(|error| {
                 RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                    .with_failure_class(error.to_failure_class())
             })? {
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
@@ -5786,6 +6175,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 .await
                 .map_err(|error| {
                     RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                        .with_failure_class(error.to_failure_class())
                 })?;
             let mut events = response_to_events(response, out)?;
             push_prompt_cache_record(&self.client, &mut events);
@@ -6804,6 +7194,8 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp")?;
     writeln!(out, "  claw skills")?;
+    writeln!(out, "  claw task create --from-json <path|->")?;
+    writeln!(out, "  claw task validate <path|->")?;
     writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw logout")?;
@@ -6917,10 +7309,11 @@ mod tests {
         render_diff_report_for, render_memory_report, render_repl_help, render_resume_usage,
         resolve_model_alias, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
+        check_workspace_health, status_json_value,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        SlashCommand, StatusUsage, DEFAULT_MODEL,
+        DiagnosticLevel, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
+        LocalHelpTopic, SlashCommand, StatusUsage, TaskCliAction, DEFAULT_MODEL,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -7603,6 +7996,31 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&[
+                "task".to_string(),
+                "create".to_string(),
+                "--from-json".to_string(),
+                "packet.json".to_string(),
+            ])
+            .expect("task create should parse"),
+            CliAction::Task {
+                action: TaskCliAction::Create {
+                    source: "packet.json".to_string(),
+                    output_format: CliOutputFormat::Text,
+                },
+            }
+        );
+        assert_eq!(
+            parse_args(&["task".to_string(), "validate".to_string(), "-".to_string(),])
+                .expect("task validate should parse"),
+            CliAction::Task {
+                action: TaskCliAction::Validate {
+                    source: "-".to_string(),
+                    output_format: CliOutputFormat::Text,
+                },
+            }
+        );
+        assert_eq!(
             parse_args(&["agents".to_string(), "--help".to_string()])
                 .expect("agents help should parse"),
             CliAction::Agents {
@@ -7628,6 +8046,29 @@ mod tests {
             parse_args(&["doctor".to_string(), "--help".to_string()])
                 .expect("doctor help should parse"),
             CliAction::HelpTopic(LocalHelpTopic::Doctor)
+        );
+        assert_eq!(
+            parse_args(&["task".to_string(), "--help".to_string()])
+                .expect("task help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Task)
+        );
+        assert_eq!(
+            parse_args(&[
+                "task".to_string(),
+                "create".to_string(),
+                "--help".to_string(),
+            ])
+            .expect("task create help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::TaskCreate)
+        );
+        assert_eq!(
+            parse_args(&[
+                "task".to_string(),
+                "validate".to_string(),
+                "--help".to_string(),
+            ])
+            .expect("task validate help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::TaskValidate)
         );
     }
 
@@ -7683,6 +8124,21 @@ mod tests {
             CliAction::Skills {
                 args: Some("help".to_string()),
                 output_format: CliOutputFormat::Json,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "--output-format=json".to_string(),
+                "task".to_string(),
+                "validate".to_string(),
+                "packet.json".to_string(),
+            ])
+            .expect("json task validate should parse"),
+            CliAction::Task {
+                action: TaskCliAction::Validate {
+                    source: "packet.json".to_string(),
+                    output_format: CliOutputFormat::Json,
+                },
             }
         );
     }
@@ -8214,6 +8670,8 @@ mod tests {
                     conflicted_files: 0,
                 },
                 sandbox_status: runtime::SandboxStatus::default(),
+                stale_against_main: false,
+                missing_commits_count: 0,
             },
         );
         assert!(status.contains("Status"));
@@ -8235,7 +8693,106 @@ mod tests {
         assert!(status.contains("Session          session.jsonl"));
         assert!(status.contains("Config files     loaded 2/3"));
         assert!(status.contains("Memory files     4"));
+        assert!(status.contains("Stale vs main    false"));
+        assert!(status.contains("Missing commits  0"));
         assert!(status.contains("Suggested flow   /status → /diff → /commit"));
+    }
+
+    #[test]
+    fn status_report_surfaces_stale_branch_info_when_behind_main() {
+        // given — a workspace context reporting stale branch
+        let context = super::StatusContext {
+            cwd: PathBuf::from("/tmp/project"),
+            session_path: None,
+            loaded_config_files: 1,
+            discovered_config_files: 1,
+            memory_file_count: 0,
+            project_root: Some(PathBuf::from("/tmp")),
+            git_branch: Some("feature/wip".to_string()),
+            git_summary: GitWorkspaceSummary::default(),
+            sandbox_status: runtime::SandboxStatus::default(),
+            stale_against_main: true,
+            missing_commits_count: 3,
+        };
+
+        // when
+        let status = format_status_report(
+            "claude-opus-4-6",
+            StatusUsage {
+                message_count: 0,
+                turns: 0,
+                latest: runtime::TokenUsage::default(),
+                cumulative: runtime::TokenUsage::default(),
+                estimated_tokens: 0,
+            },
+            "danger-full-access",
+            &context,
+        );
+
+        // then — stale info appears in text output
+        assert!(status.contains("Stale vs main    true"));
+        assert!(status.contains("Missing commits  3"));
+    }
+
+    #[test]
+    fn status_json_includes_stale_branch_fields_under_workspace() {
+        // given — a workspace context with stale branch data
+        let context = super::StatusContext {
+            cwd: PathBuf::from("/tmp/project"),
+            session_path: None,
+            loaded_config_files: 0,
+            discovered_config_files: 0,
+            memory_file_count: 0,
+            project_root: Some(PathBuf::from("/tmp")),
+            git_branch: Some("topic".to_string()),
+            git_summary: GitWorkspaceSummary::default(),
+            sandbox_status: runtime::SandboxStatus::default(),
+            stale_against_main: true,
+            missing_commits_count: 5,
+        };
+        let workers = super::StatusWorkersSnapshot::empty("none");
+
+        // when
+        let json = super::status_json_value("test-model", super::StatusUsage {
+            message_count: 0,
+            turns: 0,
+            latest: runtime::TokenUsage::default(),
+            cumulative: runtime::TokenUsage::default(),
+            estimated_tokens: 0,
+        }, "danger-full-access", &context, &workers);
+
+        // then — workspace section contains typed stale fields
+        assert_eq!(json["workspace"]["stale_against_main"], true);
+        assert_eq!(json["workspace"]["missing_commits_count"], 5);
+    }
+
+    #[test]
+    fn doctor_workspace_check_warns_when_branch_is_stale() {
+        // given — a workspace context reporting stale branch
+        let context = super::StatusContext {
+            cwd: PathBuf::from("/tmp/stale-project"),
+            session_path: None,
+            loaded_config_files: 1,
+            discovered_config_files: 1,
+            memory_file_count: 0,
+            project_root: Some(PathBuf::from("/tmp")),
+            git_branch: Some("feature/old".to_string()),
+            git_summary: GitWorkspaceSummary::default(),
+            sandbox_status: runtime::SandboxStatus::default(),
+            stale_against_main: true,
+            missing_commits_count: 2,
+        };
+
+        // when
+        let check = super::check_workspace_health(&context);
+
+        // then — level is warn, not fail, and fields are in structured data
+        assert_eq!(check.level, super::DiagnosticLevel::Warn);
+        assert!(check.summary.contains("behind main"));
+        assert!(check.summary.contains("2 commit(s)"));
+        let json = check.json_value();
+        assert_eq!(json["stale_against_main"], true);
+        assert_eq!(json["missing_commits_count"], 2);
     }
 
     #[test]
@@ -8480,6 +9037,135 @@ UU conflicted.rs",
         assert!(context.cwd.is_absolute());
         assert!(context.discovered_config_files >= context.loaded_config_files);
         assert!(context.loaded_config_files <= context.discovered_config_files);
+    }
+
+    #[test]
+    fn format_status_report_includes_stale_branch_fields() {
+        // given
+        let context = super::StatusContext {
+            cwd: PathBuf::from("/tmp/stale-test"),
+            session_path: None,
+            loaded_config_files: 0,
+            discovered_config_files: 0,
+            memory_file_count: 0,
+            project_root: Some(PathBuf::from("/tmp/stale-test")),
+            git_branch: Some("feature/stale".to_string()),
+            git_summary: GitWorkspaceSummary::default(),
+            sandbox_status: runtime::SandboxStatus::default(),
+            stale_against_main: true,
+            missing_commits_count: 5,
+        };
+        let usage = StatusUsage {
+            message_count: 0,
+            turns: 0,
+            latest: runtime::TokenUsage::default(),
+            cumulative: runtime::TokenUsage::default(),
+            estimated_tokens: 0,
+        };
+
+        // when
+        let report = format_status_report("test-model", usage, "read-only", &context);
+
+        // then
+        assert!(report.contains("Stale vs main    true"), "{report}");
+        assert!(report.contains("Missing commits  5"), "{report}");
+    }
+
+    #[test]
+    fn status_json_value_includes_stale_branch_fields_under_workspace() {
+        // given
+        let context = super::StatusContext {
+            cwd: PathBuf::from("/tmp/json-stale"),
+            session_path: None,
+            loaded_config_files: 0,
+            discovered_config_files: 0,
+            memory_file_count: 0,
+            project_root: Some(PathBuf::from("/tmp/json-stale")),
+            git_branch: Some("feature/diverged".to_string()),
+            git_summary: GitWorkspaceSummary::default(),
+            sandbox_status: runtime::SandboxStatus::default(),
+            stale_against_main: true,
+            missing_commits_count: 3,
+        };
+        let usage = StatusUsage {
+            message_count: 0,
+            turns: 0,
+            latest: runtime::TokenUsage::default(),
+            cumulative: runtime::TokenUsage::default(),
+            estimated_tokens: 0,
+        };
+        let workers = super::StatusWorkersSnapshot::empty("none");
+
+        // when
+        let value = super::status_json_value("test-model", usage, "read-only", &context, &workers);
+
+        // then
+        assert_eq!(value["workspace"]["stale_against_main"], true);
+        assert_eq!(value["workspace"]["missing_commits_count"], 3);
+    }
+
+    #[test]
+    fn check_workspace_health_warns_when_stale() {
+        // given
+        let context = super::StatusContext {
+            cwd: PathBuf::from("/tmp/ws-health-stale"),
+            session_path: None,
+            loaded_config_files: 0,
+            discovered_config_files: 0,
+            memory_file_count: 0,
+            project_root: Some(PathBuf::from("/tmp/ws-health-stale")),
+            git_branch: Some("feature/behind".to_string()),
+            git_summary: GitWorkspaceSummary::default(),
+            sandbox_status: runtime::SandboxStatus::default(),
+            stale_against_main: true,
+            missing_commits_count: 7,
+        };
+
+        // when
+        let check = super::check_workspace_health(&context);
+
+        // then
+        assert_eq!(check.level, super::DiagnosticLevel::Warn);
+        assert!(
+            check.summary.contains("7 commit(s) behind main"),
+            "{}",
+            check.summary
+        );
+        let json = check.json_value();
+        assert_eq!(json["stale_against_main"], true);
+        assert_eq!(json["missing_commits_count"], 7);
+    }
+
+    #[test]
+    fn check_workspace_health_ok_when_fresh() {
+        // given
+        let context = super::StatusContext {
+            cwd: PathBuf::from("/tmp/ws-health-fresh"),
+            session_path: None,
+            loaded_config_files: 0,
+            discovered_config_files: 0,
+            memory_file_count: 0,
+            project_root: Some(PathBuf::from("/tmp/ws-health-fresh")),
+            git_branch: Some("main".to_string()),
+            git_summary: GitWorkspaceSummary::default(),
+            sandbox_status: runtime::SandboxStatus::default(),
+            stale_against_main: false,
+            missing_commits_count: 0,
+        };
+
+        // when
+        let check = super::check_workspace_health(&context);
+
+        // then
+        assert_eq!(check.level, super::DiagnosticLevel::Ok);
+        assert!(
+            check.summary.contains("project root detected"),
+            "{}",
+            check.summary
+        );
+        let json = check.json_value();
+        assert_eq!(json["stale_against_main"], false);
+        assert_eq!(json["missing_commits_count"], 0);
     }
 
     #[test]

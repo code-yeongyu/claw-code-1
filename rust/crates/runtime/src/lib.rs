@@ -4,6 +4,7 @@
 //! MCP plumbing, tool-facing file operations, and the core conversation loop
 //! that drives interactive and one-shot turns.
 
+mod actionable_summary;
 mod bash;
 pub mod bash_validation;
 mod bootstrap;
@@ -40,11 +41,11 @@ pub mod summary_compression;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
-#[cfg(test)]
 mod trust_resolver;
 mod usage;
 pub mod worker_boot;
 
+pub use actionable_summary::{derive_actionable_summary, ActionableSummary};
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
@@ -57,7 +58,7 @@ pub use config::{
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
-    RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
+    RuntimePermissionRuleConfig, RuntimePluginConfig, RuntimeTrustConfig, ScopedMcpServerConfig,
     CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use conversation::{
@@ -70,12 +71,13 @@ pub use file_ops::{
     GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
     WriteFileOutput,
 };
+pub use green_contract::GreenLevel;
 pub use hooks::{
     HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
 };
 pub use lane_events::{
-    dedupe_superseded_commit_events, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
-    LaneEventName, LaneEventStatus, LaneFailureClass,
+    dedupe_superseded_commit_events, FailureClass, LaneCommitProvenance, LaneEvent,
+    LaneEventBlocker, LaneEventName, LaneEventStatus, LaneFailureClass,
 };
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
@@ -114,7 +116,7 @@ pub use plugin_lifecycle::{
     PluginState, ResourceInfo, ServerHealth, ServerStatus, ToolInfo,
 };
 pub use policy_engine::{
-    evaluate, DiffScope, GreenLevel, LaneBlocker, LaneContext, PolicyAction, PolicyCondition,
+    evaluate, DiffScope, LaneBlocker, LaneContext, PolicyAction, PolicyCondition,
     PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus,
 };
 pub use prompt::{
@@ -142,18 +144,24 @@ pub use session::{
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_branch::{
-    apply_policy, check_freshness, BranchFreshness, StaleBranchAction, StaleBranchEvent,
+    apply_policy, check_freshness, check_freshness_in, current_branch, current_branch_cwd,
+    resolve_main_ref, resolve_main_ref_cwd, BranchFreshness, StaleBranchAction, StaleBranchEvent,
     StaleBranchPolicy,
 };
-pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
-#[cfg(test)]
-pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
+pub use task_packet::{
+    validate_packet, BranchPolicy, CommitPolicy, ReportingContract, TaskPacket,
+    TaskPacketValidationError, TaskScope, ValidatedPacket,
+};
+pub use trust_resolver::{
+    TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver, TrustState,
+};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
 };
 pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
-    WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,
+    WorkerLifecycleState, WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus,
+    WorkerTrustResolution,
 };
 
 #[cfg(test)]

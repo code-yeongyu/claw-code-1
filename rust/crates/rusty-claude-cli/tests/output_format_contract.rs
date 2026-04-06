@@ -1,9 +1,11 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use runtime::{ConversationMessage, Session, WorkerRegistry};
 use serde_json::Value;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -39,10 +41,67 @@ fn status_and_sandbox_emit_json_when_requested() {
     let status = assert_json_command(&root, &["--output-format", "json", "status"]);
     assert_eq!(status["kind"], "status");
     assert!(status["workspace"]["cwd"].as_str().is_some());
+    assert_eq!(status["workers"]["source"], "none");
+    assert_eq!(status["workers"]["count"], 0);
+    assert!(status["workers"]["items"].is_array());
+
+    assert!(status["workspace"]["stale_against_main"].is_boolean());
+    assert!(status["workspace"]["missing_commits_count"].is_number());
 
     let sandbox = assert_json_command(&root, &["--output-format", "json", "sandbox"]);
     assert_eq!(sandbox["kind"], "sandbox");
     assert!(sandbox["filesystem_mode"].as_str().is_some());
+}
+
+#[test]
+fn standalone_status_reads_worker_snapshots_from_latest_managed_session() {
+    let root = unique_temp_dir("status-workers-latest-session-json");
+    let sessions_dir = root.join(".claw").join("sessions");
+    fs::create_dir_all(&sessions_dir).expect("sessions dir should exist");
+
+    let registry = WorkerRegistry::new();
+    let worker = registry.create("/tmp/repo-status-worker", runtime::TrustConfig::new(), true);
+    let accepted = registry
+        .observe(&worker.worker_id, "Ready for your input\n>")
+        .expect("ready observe should succeed");
+    let accepted = registry
+        .send_prompt(&accepted.worker_id, Some("persist latest managed worker"))
+        .expect("prompt send should succeed");
+
+    let session_path = sessions_dir.join("worker-session.jsonl");
+    let mut session = Session::new();
+    session
+        .push_user_text("latest managed session worker fixture")
+        .expect("session write should succeed");
+    session
+        .push_message(ConversationMessage::tool_result(
+            "toolu_latest_worker",
+            "WorkerSendPrompt",
+            serde_json::to_string_pretty(&accepted).expect("worker should serialize"),
+            false,
+        ))
+        .expect("worker snapshot should persist");
+    session
+        .save_to_path(&session_path)
+        .expect("session should persist");
+
+    let status = assert_json_command(&root, &["--output-format", "json", "status"]);
+    assert_eq!(status["workers"]["source"], "latest_managed_session");
+    assert_eq!(
+        status["workers"]["session"],
+        std::fs::canonicalize(&session_path).unwrap_or(session_path.clone()).display().to_string()
+    );
+    assert_eq!(status["workers"]["count"], 1);
+    assert_eq!(
+        status["workers"]["items"][0]["worker_id"],
+        accepted.worker_id
+    );
+    assert_eq!(status["workers"]["items"][0]["status"], "prompt_accepted");
+    assert_eq!(
+        status["workers"]["items"][0]["lifecycle_state"],
+        "prompt_accepted"
+    );
+    assert_eq!(status["workers"]["items"][0]["blocked"], false);
 }
 
 #[test]
@@ -227,6 +286,8 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         .expect("workspace check");
     assert!(workspace["cwd"].as_str().is_some());
     assert!(workspace["in_git_repo"].is_boolean());
+    assert!(workspace["stale_against_main"].is_boolean());
+    assert!(workspace["missing_commits_count"].is_number());
 
     let sandbox = checks
         .iter()
@@ -257,6 +318,45 @@ fn doctor_and_resume_status_emit_json_when_requested() {
     assert_eq!(resumed["usage"]["messages"], 1);
     assert!(resumed["workspace"]["cwd"].as_str().is_some());
     assert!(resumed["sandbox"]["filesystem_mode"].as_str().is_some());
+}
+
+#[test]
+fn doctor_json_exposes_failure_class_for_auth_check() {
+    // given
+    let root = unique_temp_dir("doctor-failure-class-json");
+    let isolated_home = root.join("home");
+    let isolated_config = root.join("config-home");
+    let isolated_codex = root.join("codex-home");
+    fs::create_dir_all(&isolated_home).expect("isolated home should exist");
+
+    // when
+    let doctor = assert_json_command_with_env(
+        &root,
+        &["--output-format", "json", "doctor"],
+        &[
+            ("HOME", isolated_home.to_str().expect("utf8 home")),
+            (
+                "CLAW_CONFIG_HOME",
+                isolated_config.to_str().expect("utf8 config home"),
+            ),
+            (
+                "CODEX_HOME",
+                isolated_codex.to_str().expect("utf8 codex home"),
+            ),
+            ("ANTHROPIC_API_KEY", ""),
+            ("ANTHROPIC_AUTH_TOKEN", ""),
+        ],
+    );
+
+    // then
+    let auth = doctor["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "auth")
+        .expect("auth check should exist");
+    assert_eq!(auth["status"], "warn");
+    assert_eq!(auth["failure_class"], "gateway_routing");
 }
 
 #[test]
@@ -357,8 +457,70 @@ fn resumed_version_and_init_emit_structured_json_when_requested() {
     assert!(root.join("CLAUDE.md").exists());
 }
 
+#[test]
+fn task_commands_emit_structured_json_when_requested() {
+    let root = unique_temp_dir("task-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let packet_path = root.join("packet.json");
+    fs::write(
+        &packet_path,
+        sample_task_packet_json(root.join("repo"), root.join("worktree")),
+    )
+    .expect("packet should write");
+
+    let create = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "task",
+            "create",
+            "--from-json",
+            packet_path.to_str().expect("utf8 packet path"),
+        ],
+    );
+    assert_eq!(create["kind"], "task_create");
+    assert_eq!(create["status"], "created");
+    assert_eq!(create["task_packet"]["scope"], "workspace");
+    assert_eq!(
+        create["task_packet"]["repo"],
+        root.join("repo").display().to_string()
+    );
+
+    let validate = assert_json_command_with_input(
+        &root,
+        &["--output-format", "json", "task", "validate", "-"],
+        &[],
+        &sample_task_packet_json(root.join("repo"), root.join("worktree")),
+    );
+    assert_eq!(validate["kind"], "task_validate");
+    assert_eq!(validate["valid"], true);
+    assert!(validate["errors"]
+        .as_array()
+        .expect("errors array")
+        .is_empty());
+    assert_eq!(validate["task_packet"]["commit_policy"], "required");
+}
+
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {
     assert_json_command_with_env(current_dir, args, &[])
+}
+
+fn assert_json_command_with_input(
+    current_dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    stdin: &str,
+) -> Value {
+    let output = run_claw_with_input(current_dir, args, envs, stdin);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("stdout should be valid json")
 }
 
 fn assert_json_command_with_env(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Value {
@@ -379,6 +541,48 @@ fn run_claw(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output 
         command.env(key, value);
     }
     command.output().expect("claw should launch")
+}
+
+fn run_claw_with_input(
+    current_dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    stdin: &str,
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
+    command
+        .current_dir(current_dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+
+    let mut child = command.spawn().expect("claw should launch");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(stdin.as_bytes())
+        .expect("stdin should write");
+    child.wait_with_output().expect("output should collect")
+}
+
+fn sample_task_packet_json(repo: PathBuf, worktree: PathBuf) -> String {
+    serde_json::json!({
+        "objective": "Ship typed task packet CLI",
+        "scope": "workspace",
+        "repo": repo,
+        "worktree": worktree,
+        "branch_policy": "auto_rebase",
+        "acceptance_tests": ["cargo test --workspace"],
+        "commit_policy": "required",
+        "reporting_contract": "acceptance_tests_and_commit",
+        "escalation_policy": "alert_human"
+    })
+    .to_string()
 }
 
 fn write_upstream_fixture(root: &Path) -> PathBuf {

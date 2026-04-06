@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::json::{JsonError, JsonValue};
 use crate::usage::TokenUsage;
+use crate::GreenLevel;
 
 const SESSION_VERSION: u32 = 1;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
@@ -66,6 +67,15 @@ pub struct SessionFork {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTestRun {
+    pub attempted_level: GreenLevel,
+    pub achieved_level: Option<GreenLevel>,
+    pub recorded_at_ms: u64,
+    pub head_commit: Option<String>,
+    pub command: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionPersistence {
     path: PathBuf,
 }
@@ -80,6 +90,7 @@ pub struct Session {
     pub messages: Vec<ConversationMessage>,
     pub compaction: Option<SessionCompaction>,
     pub fork: Option<SessionFork>,
+    pub test_runs: Vec<SessionTestRun>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -92,6 +103,7 @@ impl PartialEq for Session {
             && self.messages == other.messages
             && self.compaction == other.compaction
             && self.fork == other.fork
+            && self.test_runs == other.test_runs
     }
 }
 
@@ -141,6 +153,7 @@ impl Session {
             messages: Vec::new(),
             compaction: None,
             fork: None,
+            test_runs: Vec::new(),
             persistence: None,
         }
     }
@@ -211,6 +224,39 @@ impl Session {
         });
     }
 
+    pub fn record_test_run(&mut self, test_run: SessionTestRun) -> Result<(), SessionError> {
+        self.touch();
+        self.test_runs.push(test_run);
+        let persist_result = {
+            let test_run_ref = self.test_runs.last().ok_or_else(|| {
+                SessionError::Format("test run was just pushed but missing".to_string())
+            })?;
+            self.append_persisted_test_run(test_run_ref)
+        };
+        if let Err(error) = persist_result {
+            self.test_runs.pop();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn latest_test_run(&self) -> Option<&SessionTestRun> {
+        self.test_runs.last()
+    }
+
+    #[must_use]
+    pub fn latest_test_run_for_head(&self, head_commit: Option<&str>) -> Option<&SessionTestRun> {
+        match head_commit {
+            Some(head_commit) => self
+                .test_runs
+                .iter()
+                .rev()
+                .find(|test_run| test_run.head_commit.as_deref() == Some(head_commit)),
+            None => self.latest_test_run(),
+        }
+    }
+
     #[must_use]
     pub fn fork(&self, branch_name: Option<String>) -> Self {
         let now = current_time_millis();
@@ -225,6 +271,7 @@ impl Session {
                 parent_session_id: self.session_id.clone(),
                 branch_name: normalize_optional_string(branch_name),
             }),
+            test_runs: self.test_runs.clone(),
             persistence: None,
         }
     }
@@ -253,7 +300,7 @@ impl Session {
                 self.messages
                     .iter()
                     .map(ConversationMessage::to_json)
-                    .collect(),
+                    .collect::<Result<Vec<_>, _>>()?,
             ),
         );
         if let Some(compaction) = &self.compaction {
@@ -261,6 +308,17 @@ impl Session {
         }
         if let Some(fork) = &self.fork {
             object.insert("fork".to_string(), fork.to_json());
+        }
+        if !self.test_runs.is_empty() {
+            object.insert(
+                "test_runs".to_string(),
+                JsonValue::Array(
+                    self.test_runs
+                        .iter()
+                        .map(SessionTestRun::to_json)
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            );
         }
         Ok(JsonValue::Object(object))
     }
@@ -302,6 +360,17 @@ impl Session {
             .map(SessionCompaction::from_json)
             .transpose()?;
         let fork = object.get("fork").map(SessionFork::from_json).transpose()?;
+        let test_runs = object
+            .get("test_runs")
+            .and_then(JsonValue::as_array)
+            .map(|value| {
+                value
+                    .iter()
+                    .map(SessionTestRun::from_json)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             version,
             session_id,
@@ -310,6 +379,7 @@ impl Session {
             messages,
             compaction,
             fork,
+            test_runs,
             persistence: None,
         })
     }
@@ -322,6 +392,7 @@ impl Session {
         let mut messages = Vec::new();
         let mut compaction = None;
         let mut fork = None;
+        let mut test_runs = Vec::new();
 
         for (line_number, raw_line) in contents.lines().enumerate() {
             let line = raw_line.trim();
@@ -371,6 +442,11 @@ impl Session {
                         object.clone(),
                     ))?);
                 }
+                "test_run" => {
+                    test_runs.push(SessionTestRun::from_json(&JsonValue::Object(
+                        object.clone(),
+                    ))?);
+                }
                 other => {
                     return Err(SessionError::Format(format!(
                         "unsupported JSONL record type at line {}: {other}",
@@ -389,6 +465,7 @@ impl Session {
             messages,
             compaction,
             fork,
+            test_runs,
             persistence: None,
         })
     }
@@ -399,9 +476,16 @@ impl Session {
             lines.push(compaction.to_jsonl_record()?.render());
         }
         lines.extend(
+            self.test_runs
+                .iter()
+                .map(|test_run| test_run.to_jsonl_record().map(|value| value.render()))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        lines.extend(
             self.messages
                 .iter()
-                .map(|message| message_record(message).render()),
+                .map(|message| message_record(message).map(|value| value.render()))
+                .collect::<Result<Vec<_>, _>>()?,
         );
         let mut rendered = lines.join("\n");
         rendered.push('\n');
@@ -420,7 +504,23 @@ impl Session {
         }
 
         let mut file = OpenOptions::new().append(true).open(path)?;
-        writeln!(file, "{}", message_record(message).render())?;
+        writeln!(file, "{}", message_record(message)?.render())?;
+        Ok(())
+    }
+
+    fn append_persisted_test_run(&self, test_run: &SessionTestRun) -> Result<(), SessionError> {
+        let Some(path) = self.persistence_path() else {
+            return Ok(());
+        };
+
+        let needs_bootstrap = !path.exists() || fs::metadata(path)?.len() == 0;
+        if needs_bootstrap {
+            self.save_to_path(path)?;
+            return Ok(());
+        }
+
+        let mut file = OpenOptions::new().append(true).open(path)?;
+        writeln!(file, "{}", test_run.to_jsonl_record()?.render())?;
         Ok(())
     }
 
@@ -511,7 +611,7 @@ impl ConversationMessage {
     }
 
     #[must_use]
-    pub fn to_json(&self) -> JsonValue {
+    pub fn to_json(&self) -> Result<JsonValue, SessionError> {
         let mut object = BTreeMap::new();
         object.insert(
             "role".to_string(),
@@ -527,12 +627,17 @@ impl ConversationMessage {
         );
         object.insert(
             "blocks".to_string(),
-            JsonValue::Array(self.blocks.iter().map(ContentBlock::to_json).collect()),
+            JsonValue::Array(
+                self.blocks
+                    .iter()
+                    .map(ContentBlock::to_json)
+                    .collect(),
+            ),
         );
         if let Some(usage) = self.usage {
             object.insert("usage".to_string(), usage_to_json(usage));
         }
-        JsonValue::Object(object)
+        Ok(JsonValue::Object(object))
     }
 
     fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
@@ -734,11 +839,93 @@ impl SessionFork {
     }
 }
 
-fn message_record(message: &ConversationMessage) -> JsonValue {
+impl SessionTestRun {
+    #[must_use]
+    pub fn new(
+        attempted_level: GreenLevel,
+        achieved_level: Option<GreenLevel>,
+        recorded_at_ms: u64,
+        head_commit: Option<String>,
+        command: Option<String>,
+    ) -> Self {
+        Self {
+            attempted_level,
+            achieved_level,
+            recorded_at_ms,
+            head_commit: normalize_optional_string(head_commit),
+            command: normalize_optional_string(command),
+        }
+    }
+
+    pub fn to_json(&self) -> Result<JsonValue, SessionError> {
+        let mut object = BTreeMap::new();
+        object.insert(
+            "attempted_level".to_string(),
+            JsonValue::String(self.attempted_level.as_str().to_string()),
+        );
+        if let Some(achieved_level) = self.achieved_level {
+            object.insert(
+                "achieved_level".to_string(),
+                JsonValue::String(achieved_level.as_str().to_string()),
+            );
+        }
+        object.insert(
+            "recorded_at_ms".to_string(),
+            JsonValue::Number(i64_from_u64(self.recorded_at_ms, "recorded_at_ms")?),
+        );
+        if let Some(head_commit) = &self.head_commit {
+            object.insert(
+                "head_commit".to_string(),
+                JsonValue::String(head_commit.clone()),
+            );
+        }
+        if let Some(command) = &self.command {
+            object.insert("command".to_string(), JsonValue::String(command.clone()));
+        }
+        Ok(JsonValue::Object(object))
+    }
+
+    pub fn to_jsonl_record(&self) -> Result<JsonValue, SessionError> {
+        let mut object = match self.to_json()? {
+            JsonValue::Object(object) => object,
+            _ => unreachable!("test run should serialize to an object"),
+        };
+        object.insert(
+            "type".to_string(),
+            JsonValue::String("test_run".to_string()),
+        );
+        Ok(JsonValue::Object(object))
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| SessionError::Format("test run must be an object".to_string()))?;
+        Ok(Self {
+            attempted_level: parse_green_level(object, "attempted_level")?,
+            achieved_level: object
+                .get("achieved_level")
+                .map(parse_optional_green_level)
+                .transpose()?
+                .flatten(),
+            recorded_at_ms: required_u64(object, "recorded_at_ms")?,
+            head_commit: object
+                .get("head_commit")
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned),
+            command: object
+                .get("command")
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned),
+        })
+    }
+}
+
+fn message_record(message: &ConversationMessage) -> Result<JsonValue, SessionError> {
     let mut object = BTreeMap::new();
     object.insert("type".to_string(), JsonValue::String("message".to_string()));
-    object.insert("message".to_string(), message.to_json());
-    JsonValue::Object(object)
+    object.insert("message".to_string(), message.to_json()?);
+    Ok(JsonValue::Object(object))
 }
 
 fn usage_to_json(usage: TokenUsage) -> JsonValue {
@@ -783,6 +970,35 @@ fn required_string(
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned)
         .ok_or_else(|| SessionError::Format(format!("missing {key}")))
+}
+
+fn parse_green_level(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Result<GreenLevel, SessionError> {
+    let s = required_string(object, key)?;
+    match s.as_str() {
+        "targeted_tests_green" => Ok(GreenLevel::TargetedTests),
+        "package_green" => Ok(GreenLevel::Package),
+        "workspace_green" => Ok(GreenLevel::Workspace),
+        "merge_ready_green" => Ok(GreenLevel::MergeReady),
+        other => Err(SessionError::Format(format!(
+            "unknown green level: {other}"
+        ))),
+    }
+}
+
+fn parse_optional_green_level(value: &JsonValue) -> Result<Option<GreenLevel>, SessionError> {
+    match value.as_str() {
+        None => Ok(None),
+        Some("targeted_tests_green") => Ok(Some(GreenLevel::TargetedTests)),
+        Some("package_green") => Ok(Some(GreenLevel::Package)),
+        Some("workspace_green") => Ok(Some(GreenLevel::Workspace)),
+        Some("merge_ready_green") => Ok(Some(GreenLevel::MergeReady)),
+        Some(other) => Err(SessionError::Format(format!(
+            "unknown green level: {other}"
+        ))),
+    }
 }
 
 fn required_u32(object: &BTreeMap<String, JsonValue>, key: &str) -> Result<u32, SessionError> {
@@ -995,7 +1211,9 @@ mod tests {
                 ("version".to_string(), JsonValue::Number(1)),
                 (
                     "messages".to_string(),
-                    JsonValue::Array(vec![ConversationMessage::user_text("legacy").to_json()]),
+                    JsonValue::Array(vec![ConversationMessage::user_text("legacy")
+                        .to_json()
+                        .expect("legacy message should serialize")]),
                 ),
             ]
             .into_iter()

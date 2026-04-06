@@ -55,12 +55,19 @@ pub struct RuntimePluginConfig {
 pub struct RuntimeFeatureConfig {
     hooks: RuntimeHookConfig,
     plugins: RuntimePluginConfig,
+    trust: RuntimeTrustConfig,
     mcp: McpConfigCollection,
     oauth: Option<OAuthConfig>,
     model: Option<String>,
     permission_mode: Option<ResolvedPermissionMode>,
     permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeTrustConfig {
+    allowlist: Vec<PathBuf>,
+    denylist: Vec<PathBuf>,
 }
 
 /// Hook command lists grouped by lifecycle stage.
@@ -259,6 +266,7 @@ impl ConfigLoader {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();
         let mut mcp_servers = BTreeMap::new();
+        let mut trust = RuntimeTrustConfig::default();
 
         for entry in self.discover() {
             let Some(value) = read_optional_json_object(&entry.path)? else {
@@ -266,6 +274,7 @@ impl ConfigLoader {
             };
             validate_optional_hooks_config(&value, &entry.path)?;
             merge_mcp_servers(&mut mcp_servers, entry.source, &value, &entry.path)?;
+            merge_trust_config(&mut trust, &value, &entry.path)?;
             deep_merge_objects(&mut merged, &value);
             loaded_entries.push(entry);
         }
@@ -275,6 +284,7 @@ impl ConfigLoader {
         let feature_config = RuntimeFeatureConfig {
             hooks: parse_optional_hooks_config(&merged_value)?,
             plugins: parse_optional_plugin_config(&merged_value)?,
+            trust,
             mcp: McpConfigCollection {
                 servers: mcp_servers,
             },
@@ -344,6 +354,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn trust(&self) -> &RuntimeTrustConfig {
+        &self.feature_config.trust
+    }
+
+    #[must_use]
     pub fn oauth(&self) -> Option<&OAuthConfig> {
         self.feature_config.oauth.as_ref()
     }
@@ -390,6 +405,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn plugins(&self) -> &RuntimePluginConfig {
         &self.plugins
+    }
+
+    #[must_use]
+    pub fn trust(&self) -> &RuntimeTrustConfig {
+        &self.trust
     }
 
     #[must_use]
@@ -459,6 +479,18 @@ impl RuntimePluginConfig {
             .get(plugin_id)
             .copied()
             .unwrap_or(default_enabled)
+    }
+}
+
+impl RuntimeTrustConfig {
+    #[must_use]
+    pub fn allowlist(&self) -> &[PathBuf] {
+        &self.allowlist
+    }
+
+    #[must_use]
+    pub fn denylist(&self) -> &[PathBuf] {
+        &self.denylist
     }
 }
 
@@ -628,6 +660,44 @@ fn merge_mcp_servers(
         );
     }
     Ok(())
+}
+
+fn merge_trust_config(
+    target: &mut RuntimeTrustConfig,
+    root: &BTreeMap<String, JsonValue>,
+    path: &Path,
+) -> Result<(), ConfigError> {
+    let Some(trust_value) = root.get("trust") else {
+        return Ok(());
+    };
+    let context = format!("{}: trust", path.display());
+    let trust = expect_object(trust_value, &context)?;
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+
+    for entry in optional_string_array(trust, "allowlist", &context)?.unwrap_or_default() {
+        push_unique_path(
+            &mut target.allowlist,
+            resolve_config_relative_path(base_dir, &entry),
+        );
+    }
+    for entry in optional_string_array(trust, "denylist", &context)?.unwrap_or_default() {
+        push_unique_path(
+            &mut target.denylist,
+            resolve_config_relative_path(base_dir, &entry),
+        );
+    }
+
+    Ok(())
+}
+
+fn resolve_config_relative_path(base_dir: &Path, value: &str) -> PathBuf {
+    let raw = Path::new(value);
+    let candidate = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        base_dir.join(raw)
+    };
+    fs::canonicalize(&candidate).unwrap_or(candidate)
 }
 
 fn parse_optional_model(root: &JsonValue) -> Option<String> {
@@ -1082,6 +1152,12 @@ fn push_unique(target: &mut Vec<String>, value: String) {
     }
 }
 
+fn push_unique_path(target: &mut Vec<PathBuf>, value: PathBuf) {
+    if !target.iter().any(|existing| existing == &value) {
+        target.push(value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1467,6 +1543,85 @@ mod tests {
             Some("plugin-cache/installed.json")
         );
         assert_eq!(loaded.plugins().bundled_root(), Some("./bundled-plugins"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn trust_config_accumulates_across_entries_and_resolves_relative_paths_per_file() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(home.join("trusted").join("global-repo")).expect("global repo dir");
+        fs::create_dir_all(cwd.join("repos").join("local-repo")).expect("local repo dir");
+        fs::create_dir_all(cwd.join("blocked").join("deny-repo")).expect("deny repo dir");
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "trust": {
+                "allowlist": ["trusted/global-repo"]
+              }
+            }"#,
+        )
+        .expect("write user trust settings");
+        fs::write(
+            cwd.join(".claw").join("settings.json"),
+            r#"{
+              "trust": {
+                "allowlist": ["../repos/local-repo"],
+                "denylist": ["../blocked/deny-repo"]
+              }
+            }"#,
+        )
+        .expect("write project trust settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let expected_global = fs::canonicalize(home.join("trusted").join("global-repo"))
+            .expect("global repo canonical path");
+        let expected_local = fs::canonicalize(cwd.join("repos").join("local-repo"))
+            .expect("local repo canonical path");
+        let expected_deny = fs::canonicalize(cwd.join("blocked").join("deny-repo"))
+            .expect("deny repo canonical path");
+        assert_eq!(
+            loaded.trust().allowlist(),
+            &[expected_global, expected_local]
+        );
+        assert_eq!(loaded.trust().denylist(), &[expected_deny]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn trust_config_rejects_non_array_entries_with_source_context() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let settings_path = cwd.join(".claw").join("settings.json");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(&settings_path, r#"{"trust":{"allowlist":"./repo"}}"#)
+            .expect("write invalid trust settings");
+
+        // when
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+
+        // then
+        assert!(error.to_string().contains(&format!(
+            "{}: trust: field allowlist must be an array",
+            settings_path.display()
+        )));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

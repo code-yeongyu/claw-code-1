@@ -9,6 +9,7 @@ use crate::compact::{
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
+use crate::lane_events::FailureClass;
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
@@ -86,6 +87,7 @@ impl std::error::Error for ToolError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
+    failure_class: Option<FailureClass>,
 }
 
 impl RuntimeError {
@@ -93,7 +95,19 @@ impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            failure_class: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_failure_class(mut self, failure_class: FailureClass) -> Self {
+        self.failure_class = Some(failure_class);
+        self
+    }
+
+    #[must_use]
+    pub fn failure_class(&self) -> Option<FailureClass> {
+        self.failure_class
     }
 }
 
@@ -643,6 +657,12 @@ where
         let mut attributes = Map::new();
         attributes.insert("iteration".to_string(), Value::from(iteration as u64));
         attributes.insert("error".to_string(), Value::String(error.to_string()));
+        if let Some(failure_class) = error.failure_class() {
+            attributes.insert(
+                "failure_class".to_string(),
+                serde_json::to_value(failure_class).expect("failure class should serialize"),
+            );
+        }
         session_tracer.record("turn_failed", attributes);
     }
 }
@@ -790,6 +810,7 @@ mod tests {
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::lane_events::FailureClass;
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
@@ -798,6 +819,7 @@ mod tests {
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
     use crate::ToolError;
+    use serde_json::Value;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -957,6 +979,53 @@ mod tests {
         assert!(trace_names.contains(&"tool_execution_started"));
         assert!(trace_names.contains(&"tool_execution_finished"));
         assert!(trace_names.contains(&"turn_completed"));
+    }
+
+    #[test]
+    fn records_failure_class_on_turn_failed_session_trace_events() {
+        struct FailingApi;
+
+        impl ApiClient for FailingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Err(RuntimeError::new("upstream failed")
+                    .with_failure_class(FailureClass::GatewayRouting))
+            }
+        }
+
+        // given
+        let sink = Arc::new(MemoryTelemetrySink::default());
+        let tracer = SessionTracer::new("session-runtime-failure", sink.clone());
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            FailingApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .with_session_tracer(tracer);
+
+        // when
+        let error = runtime
+            .run_turn("hello", None)
+            .expect_err("conversation loop should surface the upstream failure");
+
+        // then
+        assert_eq!(error.failure_class(), Some(FailureClass::GatewayRouting));
+        let turn_failed = sink
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                TelemetryEvent::SessionTrace(trace) if trace.name == "turn_failed" => Some(trace),
+                _ => None,
+            })
+            .expect("turn_failed trace should be recorded");
+        assert_eq!(
+            turn_failed.attributes.get("failure_class"),
+            Some(&Value::String("gateway_routing".to_string()))
+        );
     }
 
     #[test]

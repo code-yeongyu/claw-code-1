@@ -87,7 +87,7 @@ impl TaskRegistry {
         let packet = validate_packet(packet)?.into_inner();
         Ok(self.create_task(
             packet.objective.clone(),
-            Some(packet.scope.clone()),
+            Some(packet.scope.to_string()),
             Some(packet),
         ))
     }
@@ -248,25 +248,31 @@ mod tests {
     }
 
     #[test]
-    fn creates_task_from_packet() {
+    fn given_valid_packet_when_creating_from_packet_then_task_keeps_packet() {
+        // given
         let registry = TaskRegistry::new();
         let packet = TaskPacket {
             objective: "Ship task packet support".to_string(),
-            scope: "runtime/task system".to_string(),
-            repo: "claw-code-parity".to_string(),
-            branch_policy: "origin/main only".to_string(),
+            scope: crate::TaskScope::Workspace,
+            repo: Some(std::path::PathBuf::from("/tmp/claw-code-parity")),
+            worktree: Some(std::path::PathBuf::from(
+                "/tmp/claw-code-parity/.worktrees/runtime",
+            )),
+            branch_policy: crate::BranchPolicy::AutoRebase,
             acceptance_tests: vec!["cargo test --workspace".to_string()],
-            commit_policy: "single commit".to_string(),
-            reporting_contract: "print commit sha".to_string(),
-            escalation_policy: "manual escalation".to_string(),
+            commit_policy: crate::CommitPolicy::Required,
+            reporting_contract: crate::ReportingContract::AcceptanceTestsAndCommit,
+            escalation_policy: crate::EscalationPolicy::AlertHuman,
         };
 
+        // when
         let task = registry
             .create_from_packet(packet.clone())
             .expect("packet-backed task should be created");
 
+        // then
         assert_eq!(task.prompt, packet.objective);
-        assert_eq!(task.description.as_deref(), Some("runtime/task system"));
+        assert_eq!(task.description.as_deref(), Some("workspace"));
         assert_eq!(task.task_packet, Some(packet.clone()));
 
         let fetched = registry.get(&task.task_id).expect("task should exist");

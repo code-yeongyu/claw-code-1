@@ -2,6 +2,8 @@ use std::env::VarError;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
+use runtime::FailureClass;
+
 const GENERIC_FATAL_WRAPPER_MARKERS: &[&str] = &[
     "something went wrong while processing your request",
     "please try again, or use /new to start a fresh session",
@@ -121,6 +123,27 @@ impl ApiError {
                 "provider_transport"
             }
             Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json(_) => "runtime_io",
+        }
+    }
+
+    #[must_use]
+    pub fn to_failure_class(&self) -> FailureClass {
+        match self {
+            Self::RetriesExhausted { last_error, .. } => last_error.to_failure_class(),
+            Self::MissingCredentials { .. } | Self::ExpiredOAuthToken | Self::Auth(_) => {
+                FailureClass::GatewayRouting
+            }
+            Self::Api { status, .. } if matches!(status.as_u16(), 401 | 403 | 429) => {
+                FailureClass::GatewayRouting
+            }
+            Self::ContextWindowExceeded { .. } => FailureClass::PromptDelivery,
+            Self::Api { .. }
+            | Self::Http(_)
+            | Self::InvalidSseFrame(_)
+            | Self::BackoffOverflow { .. }
+            | Self::InvalidApiKeyEnv(_)
+            | Self::Io(_)
+            | Self::Json(_) => FailureClass::Infra,
         }
     }
 
@@ -288,6 +311,10 @@ fn looks_like_context_window_error(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::env::VarError;
+
+    use runtime::FailureClass;
+
     use super::ApiError;
 
     #[test]
@@ -349,5 +376,74 @@ mod tests {
         assert!(error.is_context_window_failure());
         assert_eq!(error.safe_failure_class(), "context_window");
         assert_eq!(error.request_id(), Some("req_ctx_123"));
+    }
+
+    #[test]
+    fn maps_api_errors_to_claw_failure_taxonomy() {
+        let cases = [
+            (
+                ApiError::missing_credentials("anthropic", &["ANTHROPIC_API_KEY"]),
+                FailureClass::GatewayRouting,
+            ),
+            (ApiError::ExpiredOAuthToken, FailureClass::GatewayRouting),
+            (
+                ApiError::Auth("invalid bearer".to_string()),
+                FailureClass::GatewayRouting,
+            ),
+            (
+                ApiError::Api {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    error_type: None,
+                    message: None,
+                    request_id: None,
+                    body: "rate limited".to_string(),
+                    retryable: true,
+                },
+                FailureClass::GatewayRouting,
+            ),
+            (
+                ApiError::ContextWindowExceeded {
+                    model: "claude-sonnet".to_string(),
+                    estimated_input_tokens: 10,
+                    requested_output_tokens: 20,
+                    estimated_total_tokens: 30,
+                    context_window_tokens: 25,
+                },
+                FailureClass::PromptDelivery,
+            ),
+            (
+                ApiError::Api {
+                    status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                    error_type: Some("api_error".to_string()),
+                    message: Some("server exploded".to_string()),
+                    request_id: None,
+                    body: String::new(),
+                    retryable: false,
+                },
+                FailureClass::Infra,
+            ),
+            (
+                ApiError::InvalidApiKeyEnv(VarError::NotPresent),
+                FailureClass::Infra,
+            ),
+            (
+                ApiError::RetriesExhausted {
+                    attempts: 3,
+                    last_error: Box::new(ApiError::Api {
+                        status: reqwest::StatusCode::UNAUTHORIZED,
+                        error_type: None,
+                        message: None,
+                        request_id: None,
+                        body: "unauthorized".to_string(),
+                        retryable: false,
+                    }),
+                },
+                FailureClass::GatewayRouting,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.to_failure_class(), expected);
+        }
     }
 }

@@ -18,6 +18,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::{TrustConfig, TrustDecision, TrustPolicy, TrustResolver, TrustState};
+
+use crate::LaneEvent;
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -31,6 +35,7 @@ pub enum WorkerStatus {
     Spawning,
     TrustRequired,
     ReadyForPrompt,
+    PromptAccepted,
     Running,
     Finished,
     Failed,
@@ -42,11 +47,25 @@ impl std::fmt::Display for WorkerStatus {
             Self::Spawning => write!(f, "spawning"),
             Self::TrustRequired => write!(f, "trust_required"),
             Self::ReadyForPrompt => write!(f, "ready_for_prompt"),
+            Self::PromptAccepted => write!(f, "prompt_accepted"),
             Self::Running => write!(f, "running"),
             Self::Finished => write!(f, "finished"),
             Self::Failed => write!(f, "failed"),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerLifecycleState {
+    Spawning,
+    TrustRequired,
+    ReadyForPrompt,
+    PromptAccepted,
+    Running,
+    Blocked,
+    Finished,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +91,7 @@ pub enum WorkerEventKind {
     TrustRequired,
     TrustResolved,
     ReadyForPrompt,
+    PromptAccepted,
     PromptMisdelivery,
     PromptReplayArmed,
     Running,
@@ -100,6 +120,8 @@ pub enum WorkerPromptTarget {
 pub enum WorkerEventPayload {
     TrustPrompt {
         cwd: String,
+        trust_state: TrustState,
+        policy: TrustPolicy,
         #[serde(skip_serializing_if = "Option::is_none")]
         resolution: Option<WorkerTrustResolution>,
     },
@@ -123,11 +145,33 @@ pub struct WorkerEvent {
     pub timestamp: u64,
 }
 
+impl WorkerEvent {
+    #[must_use]
+    pub fn as_lane_event(&self) -> Option<LaneEvent> {
+        match self.kind {
+            WorkerEventKind::ReadyForPrompt => Some(
+                LaneEvent::ready(self.timestamp.to_string())
+                    .with_optional_detail(self.detail.clone()),
+            ),
+            WorkerEventKind::PromptMisdelivery => Some(LaneEvent::prompt_misdelivery(
+                self.timestamp.to_string(),
+                self.detail.clone(),
+                self.payload.as_ref().map(|payload| {
+                    serde_json::to_value(payload).expect("worker payload should serialize")
+                }),
+            )),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Worker {
     pub worker_id: String,
     pub cwd: String,
     pub status: WorkerStatus,
+    pub trust_state: TrustState,
+    pub trust_policy: TrustPolicy,
     pub trust_auto_resolve: bool,
     pub trust_gate_cleared: bool,
     pub auto_recover_prompt_misdelivery: bool,
@@ -139,6 +183,31 @@ pub struct Worker {
     pub created_at: u64,
     pub updated_at: u64,
     pub events: Vec<WorkerEvent>,
+    #[serde(skip, default)]
+    trust_config: TrustConfig,
+}
+
+impl Worker {
+    #[must_use]
+    pub fn lifecycle_state(&self) -> WorkerLifecycleState {
+        match self.status {
+            WorkerStatus::Spawning => WorkerLifecycleState::Spawning,
+            WorkerStatus::TrustRequired => WorkerLifecycleState::TrustRequired,
+            WorkerStatus::ReadyForPrompt => WorkerLifecycleState::ReadyForPrompt,
+            WorkerStatus::PromptAccepted => WorkerLifecycleState::PromptAccepted,
+            WorkerStatus::Running => WorkerLifecycleState::Running,
+            WorkerStatus::Finished => WorkerLifecycleState::Finished,
+            WorkerStatus::Failed => WorkerLifecycleState::Failed,
+        }
+    }
+
+    #[must_use]
+    pub fn is_blocked(&self) -> bool {
+        matches!(
+            self.status,
+            WorkerStatus::TrustRequired | WorkerStatus::Failed
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -162,20 +231,22 @@ impl WorkerRegistry {
     pub fn create(
         &self,
         cwd: &str,
-        trusted_roots: &[String],
+        trust_config: TrustConfig,
         auto_recover_prompt_misdelivery: bool,
     ) -> Worker {
         let mut inner = self.inner.lock().expect("worker registry lock poisoned");
         inner.counter += 1;
         let ts = now_secs();
         let worker_id = format!("worker_{:08x}_{}", ts, inner.counter);
-        let trust_auto_resolve = trusted_roots
-            .iter()
-            .any(|root| path_matches_allowlist(cwd, root));
+        let trust_resolver = TrustResolver::new(trust_config.clone());
+        let trust_policy = trust_resolver.policy_for_cwd(cwd);
+        let trust_auto_resolve = trust_policy == TrustPolicy::AutoTrust;
         let mut worker = Worker {
             worker_id: worker_id.clone(),
             cwd: cwd.to_owned(),
             status: WorkerStatus::Spawning,
+            trust_state: TrustState::Pending,
+            trust_policy,
             trust_auto_resolve,
             trust_gate_cleared: false,
             auto_recover_prompt_misdelivery,
@@ -187,6 +258,7 @@ impl WorkerRegistry {
             created_at: ts,
             updated_at: ts,
             events: Vec::new(),
+            trust_config,
         };
         push_event(
             &mut worker,
@@ -213,40 +285,52 @@ impl WorkerRegistry {
             .ok_or_else(|| format!("worker not found: {worker_id}"))?;
         let lowered = screen_text.to_ascii_lowercase();
 
-        if !worker.trust_gate_cleared && detect_trust_prompt(&lowered) {
-            worker.status = WorkerStatus::TrustRequired;
-            worker.last_error = Some(WorkerFailure {
-                kind: WorkerFailureKind::TrustGate,
-                message: "worker boot blocked on trust prompt".to_string(),
-                created_at: now_secs(),
-            });
-            push_event(
-                worker,
-                WorkerEventKind::TrustRequired,
-                WorkerStatus::TrustRequired,
-                Some("trust prompt detected".to_string()),
-                Some(WorkerEventPayload::TrustPrompt {
-                    cwd: worker.cwd.clone(),
-                    resolution: None,
-                }),
-            );
+        if !worker.trust_gate_cleared {
+            let trust_resolver = TrustResolver::new(worker.trust_config.clone());
+            let trust_decision = trust_resolver.resolve(&worker.cwd, screen_text);
+            worker.trust_policy = trust_decision.policy().unwrap_or(worker.trust_policy);
 
-            if worker.trust_auto_resolve {
-                worker.trust_gate_cleared = true;
-                worker.last_error = None;
-                worker.status = WorkerStatus::Spawning;
+            if let TrustDecision::Required { policy, state, .. } = trust_decision {
+                worker.trust_state = state;
+                worker.status = WorkerStatus::TrustRequired;
+                worker.last_error = Some(WorkerFailure {
+                    kind: WorkerFailureKind::TrustGate,
+                    message: trust_gate_message(policy).to_string(),
+                    created_at: now_secs(),
+                });
                 push_event(
                     worker,
-                    WorkerEventKind::TrustResolved,
-                    WorkerStatus::Spawning,
-                    Some("allowlisted repo auto-resolved trust prompt".to_string()),
+                    WorkerEventKind::TrustRequired,
+                    WorkerStatus::TrustRequired,
+                    Some(trust_required_detail(policy).to_string()),
                     Some(WorkerEventPayload::TrustPrompt {
                         cwd: worker.cwd.clone(),
-                        resolution: Some(WorkerTrustResolution::AutoAllowlisted),
+                        trust_state: trust_required_payload_state(state),
+                        policy,
+                        resolution: None,
                     }),
                 );
-            } else {
-                return Ok(worker.clone());
+
+                if policy == TrustPolicy::AutoTrust {
+                    worker.trust_gate_cleared = true;
+                    worker.trust_state = TrustState::Resolved;
+                    worker.last_error = None;
+                    worker.status = WorkerStatus::Spawning;
+                    push_event(
+                        worker,
+                        WorkerEventKind::TrustResolved,
+                        WorkerStatus::Spawning,
+                        Some("allowlisted repo auto-resolved trust prompt".to_string()),
+                        Some(WorkerEventPayload::TrustPrompt {
+                            cwd: worker.cwd.clone(),
+                            trust_state: TrustState::Resolved,
+                            policy,
+                            resolution: Some(WorkerTrustResolution::AutoAllowlisted),
+                        }),
+                    );
+                } else {
+                    return Ok(worker.clone());
+                }
             }
         }
 
@@ -319,6 +403,13 @@ impl WorkerRegistry {
             worker.prompt_in_flight = false;
             worker.status = WorkerStatus::Running;
             worker.last_error = None;
+            push_event(
+                worker,
+                WorkerEventKind::Running,
+                WorkerStatus::Running,
+                Some("worker accepted prompt and is now running".to_string()),
+                None,
+            );
         }
 
         if detect_ready_for_prompt(screen_text, &lowered)
@@ -358,7 +449,14 @@ impl WorkerRegistry {
             ));
         }
 
+        if worker.trust_policy == TrustPolicy::Deny {
+            return Err(format!(
+                "worker {worker_id} is denylisted and cannot be manually trusted"
+            ));
+        }
+
         worker.trust_gate_cleared = true;
+        worker.trust_state = TrustState::Resolved;
         worker.last_error = None;
         worker.status = WorkerStatus::Spawning;
         push_event(
@@ -368,6 +466,8 @@ impl WorkerRegistry {
             Some("trust prompt resolved manually".to_string()),
             Some(WorkerEventPayload::TrustPrompt {
                 cwd: worker.cwd.clone(),
+                trust_state: TrustState::Resolved,
+                policy: worker.trust_policy,
                 resolution: Some(WorkerTrustResolution::ManualApproval),
             }),
         );
@@ -400,11 +500,11 @@ impl WorkerRegistry {
         worker.last_prompt = Some(next_prompt.clone());
         worker.replay_prompt = None;
         worker.last_error = None;
-        worker.status = WorkerStatus::Running;
+        worker.status = WorkerStatus::PromptAccepted;
         push_event(
             worker,
-            WorkerEventKind::Running,
-            WorkerStatus::Running,
+            WorkerEventKind::PromptAccepted,
+            WorkerStatus::PromptAccepted,
             Some(format!(
                 "prompt dispatched to worker: {}",
                 prompt_preview(&next_prompt)
@@ -439,6 +539,7 @@ impl WorkerRegistry {
             .get_mut(worker_id)
             .ok_or_else(|| format!("worker not found: {worker_id}"))?;
         worker.status = WorkerStatus::Spawning;
+        worker.trust_state = TrustState::Pending;
         worker.trust_gate_cleared = false;
         worker.last_prompt = None;
         worker.replay_prompt = None;
@@ -570,26 +671,33 @@ fn push_event(
     });
 }
 
-fn path_matches_allowlist(cwd: &str, trusted_root: &str) -> bool {
-    let cwd = normalize_path(cwd);
-    let trusted_root = normalize_path(trusted_root);
-    cwd == trusted_root || cwd.starts_with(&trusted_root)
-}
-
 fn normalize_path(path: &str) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| Path::new(path).to_path_buf())
 }
 
-fn detect_trust_prompt(lowered: &str) -> bool {
-    [
-        "do you trust the files in this folder",
-        "trust the files in this folder",
-        "trust this folder",
-        "allow and continue",
-        "yes, proceed",
-    ]
-    .iter()
-    .any(|needle| lowered.contains(needle))
+fn trust_gate_message(policy: TrustPolicy) -> &'static str {
+    match policy {
+        TrustPolicy::AutoTrust | TrustPolicy::RequireApproval => {
+            "worker boot blocked on trust prompt"
+        }
+        TrustPolicy::Deny => {
+            "worker boot blocked because cwd is denylisted for trust auto-approval"
+        }
+    }
+}
+
+fn trust_required_detail(policy: TrustPolicy) -> &'static str {
+    match policy {
+        TrustPolicy::AutoTrust | TrustPolicy::RequireApproval => "trust prompt detected",
+        TrustPolicy::Deny => "trust prompt detected for denylisted cwd",
+    }
+}
+
+fn trust_required_payload_state(state: TrustState) -> TrustState {
+    match state {
+        TrustState::Denied => TrustState::Denied,
+        _ => TrustState::Required,
+    }
 }
 
 fn detect_ready_for_prompt(screen_text: &str, lowered: &str) -> bool {
@@ -755,22 +863,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lifecycle_states_serialize_to_expected_wire_values() {
+        let cases = [
+            (WorkerLifecycleState::Spawning, "spawning"),
+            (WorkerLifecycleState::TrustRequired, "trust_required"),
+            (WorkerLifecycleState::ReadyForPrompt, "ready_for_prompt"),
+            (WorkerLifecycleState::PromptAccepted, "prompt_accepted"),
+            (WorkerLifecycleState::Running, "running"),
+            (WorkerLifecycleState::Blocked, "blocked"),
+            (WorkerLifecycleState::Finished, "finished"),
+            (WorkerLifecycleState::Failed, "failed"),
+        ];
+
+        for (state, expected) in cases {
+            assert_eq!(
+                serde_json::to_value(state).expect("serialize lifecycle state"),
+                serde_json::Value::String(expected.to_string())
+            );
+        }
+    }
+
+    #[test]
     fn allowlisted_trust_prompt_auto_resolves_then_reaches_ready_state() {
+        // given
         let registry = WorkerRegistry::new();
         let worker = registry.create(
             "/tmp/worktrees/repo-a",
-            &["/tmp/worktrees".to_string()],
+            TrustConfig::new().with_allowlisted("/tmp/worktrees"),
             true,
         );
 
+        // when
         let after_trust = registry
             .observe(
                 &worker.worker_id,
                 "Do you trust the files in this folder?\n1. Yes, proceed\n2. No",
             )
             .expect("trust observe should succeed");
+
+        // then
         assert_eq!(after_trust.status, WorkerStatus::Spawning);
         assert!(after_trust.trust_gate_cleared);
+        assert_eq!(after_trust.trust_state, TrustState::Resolved);
         let trust_required = after_trust
             .events
             .iter()
@@ -780,6 +914,8 @@ mod tests {
             trust_required.payload,
             Some(WorkerEventPayload::TrustPrompt {
                 cwd: "/tmp/worktrees/repo-a".to_string(),
+                trust_state: TrustState::Required,
+                policy: TrustPolicy::AutoTrust,
                 resolution: None,
             })
         );
@@ -792,6 +928,8 @@ mod tests {
             trust_resolved.payload,
             Some(WorkerEventPayload::TrustPrompt {
                 cwd: "/tmp/worktrees/repo-a".to_string(),
+                trust_state: TrustState::Resolved,
+                policy: TrustPolicy::AutoTrust,
                 resolution: Some(WorkerTrustResolution::AutoAllowlisted),
             })
         );
@@ -805,16 +943,21 @@ mod tests {
 
     #[test]
     fn trust_prompt_blocks_non_allowlisted_worker_until_resolved() {
+        // given
         let registry = WorkerRegistry::new();
-        let worker = registry.create("/tmp/repo-b", &[], true);
+        let worker = registry.create("/tmp/repo-b", TrustConfig::new(), true);
 
+        // when
         let blocked = registry
             .observe(
                 &worker.worker_id,
                 "Do you trust the files in this folder?\n1. Yes, proceed\n2. No",
             )
             .expect("trust observe should succeed");
+
+        // then
         assert_eq!(blocked.status, WorkerStatus::TrustRequired);
+        assert_eq!(blocked.trust_state, TrustState::Required);
         assert_eq!(
             blocked.last_error.expect("trust error should exist").kind,
             WorkerFailureKind::TrustGate
@@ -839,9 +982,53 @@ mod tests {
             trust_resolved.payload,
             Some(WorkerEventPayload::TrustPrompt {
                 cwd: "/tmp/repo-b".to_string(),
+                trust_state: TrustState::Resolved,
+                policy: TrustPolicy::RequireApproval,
                 resolution: Some(WorkerTrustResolution::ManualApproval),
             })
         );
+    }
+
+    #[test]
+    fn denylisted_worker_stays_gated_and_rejects_manual_trust_resolution() {
+        // given
+        let registry = WorkerRegistry::new();
+        let worker = registry.create(
+            "/tmp/repo-denied",
+            TrustConfig::new().with_denied("/tmp/repo-denied"),
+            true,
+        );
+
+        // when
+        let blocked = registry
+            .observe(
+                &worker.worker_id,
+                "Do you trust the files in this folder?\n1. Yes, proceed\n2. No",
+            )
+            .expect("trust observe should succeed");
+        let resolve_error = registry
+            .resolve_trust(&worker.worker_id)
+            .expect_err("denylisted worker should stay blocked");
+
+        // then
+        assert_eq!(blocked.status, WorkerStatus::TrustRequired);
+        assert_eq!(blocked.trust_state, TrustState::Denied);
+        assert!(!blocked.trust_gate_cleared);
+        let trust_required = blocked
+            .events
+            .iter()
+            .find(|event| event.kind == WorkerEventKind::TrustRequired)
+            .expect("trust required event should exist");
+        assert_eq!(
+            trust_required.payload,
+            Some(WorkerEventPayload::TrustPrompt {
+                cwd: "/tmp/repo-denied".to_string(),
+                trust_state: TrustState::Denied,
+                policy: TrustPolicy::Deny,
+                resolution: None,
+            })
+        );
+        assert!(resolve_error.contains("denylisted"));
     }
 
     #[test]
@@ -854,17 +1041,21 @@ mod tests {
     #[test]
     fn prompt_misdelivery_is_detected_and_replay_can_be_rearmed() {
         let registry = WorkerRegistry::new();
-        let worker = registry.create("/tmp/repo-c", &[], true);
+        let worker = registry.create("/tmp/repo-c", TrustConfig::new(), true);
         registry
             .observe(&worker.worker_id, "Ready for input\n>")
             .expect("ready observe should succeed");
 
-        let running = registry
+        let accepted = registry
             .send_prompt(&worker.worker_id, Some("Implement worker handshake"))
             .expect("prompt send should succeed");
-        assert_eq!(running.status, WorkerStatus::Running);
-        assert_eq!(running.prompt_delivery_attempts, 1);
-        assert!(running.prompt_in_flight);
+        assert_eq!(accepted.status, WorkerStatus::PromptAccepted);
+        assert_eq!(accepted.prompt_delivery_attempts, 1);
+        assert!(accepted.prompt_in_flight);
+        assert!(accepted
+            .events
+            .iter()
+            .any(|event| event.kind == WorkerEventKind::PromptAccepted));
 
         let recovered = registry
             .observe(
@@ -918,15 +1109,43 @@ mod tests {
         let replayed = registry
             .send_prompt(&worker.worker_id, None)
             .expect("replay send should succeed");
-        assert_eq!(replayed.status, WorkerStatus::Running);
+        assert_eq!(replayed.status, WorkerStatus::PromptAccepted);
         assert!(replayed.replay_prompt.is_none());
         assert_eq!(replayed.prompt_delivery_attempts, 2);
     }
 
     #[test]
+    fn send_prompt_enters_prompt_accepted_until_running_cue_is_observed() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-running-cue", TrustConfig::new(), true);
+        registry
+            .observe(&worker.worker_id, "Ready for input\n>")
+            .expect("ready observe should succeed");
+
+        let accepted = registry
+            .send_prompt(&worker.worker_id, Some("Run the worker bootstrap tests"))
+            .expect("prompt send should succeed");
+        assert_eq!(accepted.status, WorkerStatus::PromptAccepted);
+        assert!(accepted.prompt_in_flight);
+
+        let running = registry
+            .observe(
+                &worker.worker_id,
+                "Thinking through the worker bootstrap tests",
+            )
+            .expect("running cue observe should succeed");
+        assert_eq!(running.status, WorkerStatus::Running);
+        assert!(!running.prompt_in_flight);
+        assert!(running
+            .events
+            .iter()
+            .any(|event| event.kind == WorkerEventKind::Running));
+    }
+
+    #[test]
     fn prompt_delivery_detects_wrong_target_and_replays_to_expected_worker() {
         let registry = WorkerRegistry::new();
-        let worker = registry.create("/tmp/repo-target-a", &[], true);
+        let worker = registry.create("/tmp/repo-target-a", TrustConfig::new(), true);
         registry
             .observe(&worker.worker_id, "Ready for input\n>")
             .expect("ready observe should succeed");
@@ -970,7 +1189,7 @@ mod tests {
     #[test]
     fn await_ready_surfaces_blocked_or_ready_worker_state() {
         let registry = WorkerRegistry::new();
-        let worker = registry.create("/tmp/repo-d", &[], false);
+        let worker = registry.create("/tmp/repo-d", TrustConfig::new(), false);
 
         let initial = registry
             .await_ready(&worker.worker_id)
@@ -1007,7 +1226,7 @@ mod tests {
     #[test]
     fn restart_and_terminate_reset_or_finish_worker() {
         let registry = WorkerRegistry::new();
-        let worker = registry.create("/tmp/repo-e", &[], true);
+        let worker = registry.create("/tmp/repo-e", TrustConfig::new(), true);
         registry
             .observe(&worker.worker_id, "Ready for input\n>")
             .expect("ready observe should succeed");
@@ -1036,7 +1255,7 @@ mod tests {
     #[test]
     fn observe_completion_classifies_provider_failure_on_unknown_finish_zero_tokens() {
         let registry = WorkerRegistry::new();
-        let worker = registry.create("/tmp/repo-f", &[], true);
+        let worker = registry.create("/tmp/repo-f", TrustConfig::new(), true);
         registry
             .observe(&worker.worker_id, "Ready for input\n>")
             .expect("ready observe should succeed");
@@ -1061,7 +1280,7 @@ mod tests {
     #[test]
     fn observe_completion_accepts_normal_finish_with_tokens() {
         let registry = WorkerRegistry::new();
-        let worker = registry.create("/tmp/repo-g", &[], true);
+        let worker = registry.create("/tmp/repo-g", TrustConfig::new(), true);
         registry
             .observe(&worker.worker_id, "Ready for input\n>")
             .expect("ready observe should succeed");
@@ -1079,5 +1298,75 @@ mod tests {
             .events
             .iter()
             .any(|event| event.kind == WorkerEventKind::Finished));
+    }
+
+    #[test]
+    fn worker_ready_event_bridges_to_lane_ready() {
+        // given
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-ready-lane", TrustConfig::new(), true);
+        let observed = registry
+            .observe(&worker.worker_id, "Ready for your input\n>")
+            .expect("ready observe should succeed");
+        let ready_event = observed
+            .events
+            .iter()
+            .find(|event| event.kind == WorkerEventKind::ReadyForPrompt)
+            .expect("ready event should exist");
+
+        // when
+        let lane_event = ready_event.as_lane_event().expect("lane ready event");
+
+        // then
+        assert_eq!(
+            serde_json::to_value(&lane_event).expect("lane event should serialize")["event"],
+            "lane.ready"
+        );
+        assert_eq!(
+            serde_json::to_value(&lane_event).expect("lane event should serialize")["status"],
+            "ready"
+        );
+        assert_eq!(
+            lane_event.detail.as_deref(),
+            Some("worker is ready for prompt delivery")
+        );
+    }
+
+    #[test]
+    fn worker_prompt_misdelivery_event_bridges_to_lane_prompt_misdelivery() {
+        // given
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-prompt-misdelivery", TrustConfig::new(), true);
+        registry
+            .observe(&worker.worker_id, "Ready for input\n>")
+            .expect("ready observe should succeed");
+        registry
+            .send_prompt(&worker.worker_id, Some("Investigate flaky boot"))
+            .expect("prompt send should succeed");
+        let recovered = registry
+            .observe(
+                &worker.worker_id,
+                "% Investigate flaky boot\nzsh: command not found: Investigate",
+            )
+            .expect("misdelivery observe should succeed");
+        let misdelivery_event = recovered
+            .events
+            .iter()
+            .find(|event| event.kind == WorkerEventKind::PromptMisdelivery)
+            .expect("misdelivery event should exist");
+
+        // when
+        let lane_event = misdelivery_event
+            .as_lane_event()
+            .expect("lane prompt misdelivery event");
+        let lane_event_json =
+            serde_json::to_value(&lane_event).expect("lane event should serialize");
+
+        // then
+        assert_eq!(lane_event_json["event"], "lane.prompt_misdelivery");
+        assert_eq!(lane_event_json["status"], "blocked");
+        assert_eq!(lane_event_json["failureClass"], "prompt_delivery");
+        assert_eq!(lane_event_json["data"]["type"], "prompt_delivery");
+        assert_eq!(lane_event_json["data"]["observed_target"], "shell");
     }
 }

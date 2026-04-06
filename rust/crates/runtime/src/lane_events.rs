@@ -34,6 +34,8 @@ pub enum LaneEventName {
     Superseded,
     #[serde(rename = "lane.closed")]
     Closed,
+    #[serde(rename = "lane.recovery_attempted")]
+    RecoveryAttempted,
     #[serde(rename = "branch.stale_against_main")]
     BranchStaleAgainstMain,
 }
@@ -46,6 +48,7 @@ pub enum LaneEventStatus {
     Blocked,
     Red,
     Green,
+    Recovering,
     Completed,
     Failed,
     Reconciled,
@@ -54,9 +57,29 @@ pub enum LaneEventStatus {
     Closed,
 }
 
+impl std::fmt::Display for LaneEventStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Running => "running",
+            Self::Ready => "ready",
+            Self::Blocked => "blocked",
+            Self::Red => "red",
+            Self::Green => "green",
+            Self::Recovering => "recovering",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Reconciled => "reconciled",
+            Self::Merged => "merged",
+            Self::Superseded => "superseded",
+            Self::Closed => "closed",
+        };
+        write!(f, "{value}")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LaneFailureClass {
+pub enum FailureClass {
     PromptDelivery,
     TrustGate,
     BranchDivergence,
@@ -69,6 +92,8 @@ pub enum LaneFailureClass {
     ToolRuntime,
     Infra,
 }
+
+pub type LaneFailureClass = FailureClass;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneEventBlocker {
@@ -128,6 +153,11 @@ impl LaneEvent {
     }
 
     #[must_use]
+    pub fn ready(emitted_at: impl Into<String>) -> Self {
+        Self::new(LaneEventName::Ready, LaneEventStatus::Ready, emitted_at)
+    }
+
+    #[must_use]
     pub fn finished(emitted_at: impl Into<String>, detail: Option<String>) -> Self {
         Self::new(
             LaneEventName::Finished,
@@ -153,6 +183,31 @@ impl LaneEvent {
     }
 
     #[must_use]
+    pub fn pr_opened(
+        emitted_at: impl Into<String>,
+        detail: Option<String>,
+        data: Option<Value>,
+    ) -> Self {
+        Self::new(
+            LaneEventName::PrOpened,
+            LaneEventStatus::Completed,
+            emitted_at,
+        )
+        .with_optional_detail(detail)
+        .with_optional_data(data)
+    }
+
+    #[must_use]
+    pub fn merge_ready(emitted_at: impl Into<String>, detail: Option<String>) -> Self {
+        Self::new(
+            LaneEventName::MergeReady,
+            LaneEventStatus::Green,
+            emitted_at,
+        )
+        .with_optional_detail(detail)
+    }
+
+    #[must_use]
     pub fn superseded(
         emitted_at: impl Into<String>,
         detail: Option<String>,
@@ -168,6 +223,21 @@ impl LaneEvent {
     }
 
     #[must_use]
+    pub fn recovery_attempted(
+        emitted_at: impl Into<String>,
+        failure_class: LaneFailureClass,
+        data: Value,
+    ) -> Self {
+        Self::new(
+            LaneEventName::RecoveryAttempted,
+            LaneEventStatus::Recovering,
+            emitted_at,
+        )
+        .with_failure_class(failure_class)
+        .with_data(data)
+    }
+
+    #[must_use]
     pub fn blocked(emitted_at: impl Into<String>, blocker: &LaneEventBlocker) -> Self {
         Self::new(LaneEventName::Blocked, LaneEventStatus::Blocked, emitted_at)
             .with_failure_class(blocker.failure_class)
@@ -175,10 +245,53 @@ impl LaneEvent {
     }
 
     #[must_use]
+    pub fn prompt_misdelivery(
+        emitted_at: impl Into<String>,
+        detail: Option<String>,
+        data: Option<Value>,
+    ) -> Self {
+        Self::new(
+            LaneEventName::PromptMisdelivery,
+            LaneEventStatus::Blocked,
+            emitted_at,
+        )
+        .with_failure_class(LaneFailureClass::PromptDelivery)
+        .with_optional_detail(detail)
+        .with_optional_data(data)
+    }
+
+    #[must_use]
     pub fn failed(emitted_at: impl Into<String>, blocker: &LaneEventBlocker) -> Self {
         Self::new(LaneEventName::Failed, LaneEventStatus::Failed, emitted_at)
             .with_failure_class(blocker.failure_class)
             .with_detail(blocker.detail.clone())
+    }
+
+    #[must_use]
+    pub fn red(emitted_at: impl Into<String>, detail: Option<String>) -> Self {
+        Self::new(LaneEventName::Red, LaneEventStatus::Red, emitted_at).with_optional_detail(detail)
+    }
+
+    #[must_use]
+    pub fn green(emitted_at: impl Into<String>, detail: Option<String>) -> Self {
+        Self::new(LaneEventName::Green, LaneEventStatus::Green, emitted_at)
+            .with_optional_detail(detail)
+    }
+
+    #[must_use]
+    pub fn branch_stale_against_main(
+        emitted_at: impl Into<String>,
+        detail: impl Into<String>,
+        data: Value,
+    ) -> Self {
+        Self::new(
+            LaneEventName::BranchStaleAgainstMain,
+            LaneEventStatus::Blocked,
+            emitted_at,
+        )
+        .with_failure_class(LaneFailureClass::BranchDivergence)
+        .with_detail(detail)
+        .with_data(data)
     }
 
     #[must_use]
@@ -196,6 +309,12 @@ impl LaneEvent {
     #[must_use]
     pub fn with_optional_detail(mut self, detail: Option<String>) -> Self {
         self.detail = detail;
+        self
+    }
+
+    #[must_use]
+    pub fn with_optional_data(mut self, data: Option<Value>) -> Self {
+        self.data = data;
         self
     }
 
@@ -273,6 +392,7 @@ mod tests {
             (LaneEventName::Merged, "lane.merged"),
             (LaneEventName::Superseded, "lane.superseded"),
             (LaneEventName::Closed, "lane.closed"),
+            (LaneEventName::RecoveryAttempted, "lane.recovery_attempted"),
             (
                 LaneEventName::BranchStaleAgainstMain,
                 "branch.stale_against_main",
@@ -350,6 +470,39 @@ mod tests {
     }
 
     #[test]
+    fn recovering_status_serializes_to_wire_value() {
+        assert_eq!(
+            serde_json::to_value(LaneEventStatus::Recovering).expect("serialize"),
+            json!("recovering")
+        );
+    }
+
+    #[test]
+    fn recovery_attempted_event_carries_failure_class_and_data() {
+        // given
+        let data = json!({"scenario": "stale_branch", "steps_taken": 2});
+
+        // when
+        let event = LaneEvent::recovery_attempted(
+            "2026-05-01T00:00:00Z",
+            LaneFailureClass::BranchDivergence,
+            data.clone(),
+        );
+
+        // then
+        assert_eq!(event.event, LaneEventName::RecoveryAttempted);
+        assert_eq!(event.status, LaneEventStatus::Recovering);
+        assert_eq!(
+            event.failure_class,
+            Some(LaneFailureClass::BranchDivergence)
+        );
+        let event_json = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(event_json["event"], "lane.recovery_attempted");
+        assert_eq!(event_json["status"], "recovering");
+        assert_eq!(event_json["data"]["scenario"], "stale_branch");
+    }
+
+    #[test]
     fn dedupes_superseded_commit_events_by_canonical_commit() {
         let retained = dedupe_superseded_commit_events(&[
             LaneEvent::commit_created(
@@ -379,5 +532,157 @@ mod tests {
         ]);
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].detail.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn canonical_lane_event_constructors_preserve_expected_statuses() {
+        // given
+        let prompt_payload = json!({
+            "observed_target": "shell",
+            "recovery_armed": true,
+        });
+        let pr_payload = json!({
+            "url": "https://github.com/example/repo/pull/42",
+        });
+        let stale_payload = json!({
+            "branch": "feature/stale",
+            "mainRef": "main",
+            "commitsBehind": 2,
+            "missingCommits": ["fix missing"],
+        });
+
+        // when
+        let ready = LaneEvent::ready("100");
+        let prompt_misdelivery = LaneEvent::prompt_misdelivery(
+            "101",
+            Some("prompt landed in shell".to_string()),
+            Some(prompt_payload.clone()),
+        );
+        let red = LaneEvent::red("102", Some("tests failed".to_string()));
+        let green = LaneEvent::green("103", Some("tests passed".to_string()));
+        let pr_opened = LaneEvent::pr_opened(
+            "104",
+            Some("opened PR #42".to_string()),
+            Some(pr_payload.clone()),
+        );
+        let merge_ready = LaneEvent::merge_ready("105", Some("ready to merge".to_string()));
+        let stale = LaneEvent::branch_stale_against_main(
+            "106",
+            "branch stale against main",
+            stale_payload.clone(),
+        );
+
+        // then
+        assert_eq!(ready.event, LaneEventName::Ready);
+        assert_eq!(ready.status, LaneEventStatus::Ready);
+        assert_eq!(prompt_misdelivery.event, LaneEventName::PromptMisdelivery);
+        assert_eq!(prompt_misdelivery.status, LaneEventStatus::Blocked);
+        assert_eq!(
+            prompt_misdelivery.failure_class,
+            Some(LaneFailureClass::PromptDelivery)
+        );
+        assert_eq!(prompt_misdelivery.data, Some(prompt_payload));
+        assert_eq!(red.status, LaneEventStatus::Red);
+        assert_eq!(green.status, LaneEventStatus::Green);
+        assert_eq!(pr_opened.event, LaneEventName::PrOpened);
+        assert_eq!(pr_opened.data, Some(pr_payload));
+        assert_eq!(merge_ready.event, LaneEventName::MergeReady);
+        assert_eq!(merge_ready.status, LaneEventStatus::Green);
+        assert_eq!(stale.event, LaneEventName::BranchStaleAgainstMain);
+        assert_eq!(
+            stale.failure_class,
+            Some(LaneFailureClass::BranchDivergence)
+        );
+        assert_eq!(stale.data, Some(stale_payload));
+    }
+
+    #[test]
+    fn lane_event_serialization_roundtrip_preserves_canonical_variants() {
+        // given
+        let blocker = LaneEventBlocker {
+            failure_class: LaneFailureClass::ToolRuntime,
+            detail: "tool failed".to_string(),
+        };
+        let events = vec![
+            LaneEvent::started("100"),
+            LaneEvent::ready("101"),
+            LaneEvent::prompt_misdelivery(
+                "102",
+                Some("prompt landed in shell".to_string()),
+                Some(json!({ "observed_target": "shell" })),
+            ),
+            LaneEvent::blocked("103", &blocker),
+            LaneEvent::red("104", Some("tests failed".to_string())),
+            LaneEvent::green("105", Some("tests passed".to_string())),
+            LaneEvent::commit_created(
+                "106",
+                Some("commit abc1234".to_string()),
+                LaneCommitProvenance {
+                    commit: "abc1234".to_string(),
+                    branch: "feature/events".to_string(),
+                    worktree: Some("wt-a".to_string()),
+                    canonical_commit: Some("abc1234".to_string()),
+                    superseded_by: None,
+                    lineage: vec!["abc1234".to_string()],
+                },
+            ),
+            LaneEvent::pr_opened(
+                "107",
+                Some("opened PR #42".to_string()),
+                Some(json!({ "url": "https://github.com/example/repo/pull/42" })),
+            ),
+            LaneEvent::merge_ready("108", Some("ready to merge".to_string())),
+            LaneEvent::finished("109", Some("lane finished cleanly".to_string())),
+            LaneEvent::failed("110", &blocker),
+            LaneEvent::branch_stale_against_main(
+                "111",
+                "branch stale against main",
+                json!({
+                    "branch": "feature/events",
+                    "mainRef": "main",
+                    "commitsBehind": 3,
+                    "missingCommits": ["fix: unblock tests"],
+                }),
+            ),
+        ];
+
+        // when
+        let serialized = serde_json::to_string(&events).expect("events should serialize");
+        let deserialized: Vec<LaneEvent> =
+            serde_json::from_str(&serialized).expect("events should deserialize");
+
+        // then
+        assert_eq!(deserialized, events);
+    }
+
+    #[test]
+    fn branch_stale_event_serializes_to_clawhip_wire_shape() {
+        // given
+        let event = LaneEvent::branch_stale_against_main(
+            "200",
+            "branch divergence detected",
+            json!({
+                "branch": "feature/stale",
+                "mainRef": "main",
+                "commitsBehind": 5,
+                "commitsAhead": 1,
+                "missingCommits": ["fix: unblock tests"],
+                "blockedCommand": "cargo test --workspace",
+                "recommendedAction": "merge or rebase main before workspace tests",
+            }),
+        );
+
+        // when
+        let event_json = serde_json::to_value(&event).expect("lane event should serialize");
+
+        // then
+        assert_eq!(event_json["event"], "branch.stale_against_main");
+        assert_eq!(event_json["status"], "blocked");
+        assert_eq!(event_json["failureClass"], "branch_divergence");
+        assert_eq!(event_json["data"]["mainRef"], "main");
+        assert_eq!(
+            event_json["data"]["blockedCommand"],
+            "cargo test --workspace"
+        );
     }
 }

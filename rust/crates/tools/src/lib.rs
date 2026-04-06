@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -11,21 +12,22 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
-    grep_search, load_system_prompt,
+    check_freshness, current_branch_cwd, dedupe_superseded_commit_events, edit_file, execute_bash,
+    glob_search, grep_search, load_system_prompt, ConfigLoader,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file,
+    read_file, resolve_main_ref_cwd,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
+    TrustConfig,
     worker_boot::{WorkerReadySnapshot, WorkerRegistry},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput,
-    LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus,
-    LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode, PermissionPolicy,
-    PromptCacheEvent, RuntimeError, Session, TaskPacket, ToolError, ToolExecutor,
+    LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneFailureClass, McpDegradedReport,
+    MessageRole, PermissionMode, PermissionPolicy, PromptCacheEvent, RuntimeError, Session,
+    TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -763,21 +765,36 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "objective": { "type": "string" },
-                    "scope": { "type": "string" },
-                    "repo": { "type": "string" },
-                    "branch_policy": { "type": "string" },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["workspace", "module", "single_file", "custom"]
+                    },
+                    "repo": { "type": ["string", "null"] },
+                    "worktree": { "type": ["string", "null"] },
+                    "branch_policy": {
+                        "type": "string",
+                        "enum": ["auto_rebase", "auto_merge_forward", "warn_only", "block"]
+                    },
                     "acceptance_tests": {
                         "type": "array",
                         "items": { "type": "string" }
                     },
-                    "commit_policy": { "type": "string" },
-                    "reporting_contract": { "type": "string" },
-                    "escalation_policy": { "type": "string" }
+                    "commit_policy": {
+                        "type": "string",
+                        "enum": ["forbid", "optional", "required"]
+                    },
+                    "reporting_contract": {
+                        "type": "string",
+                        "enum": ["summary_only", "acceptance_tests", "acceptance_tests_and_commit"]
+                    },
+                    "escalation_policy": {
+                        "type": "string",
+                        "enum": ["alert_human", "log_and_continue", "abort"]
+                    }
                 },
                 "required": [
                     "objective",
                     "scope",
-                    "repo",
                     "branch_policy",
                     "acceptance_tests",
                     "commit_policy",
@@ -1426,12 +1443,32 @@ fn run_task_output(input: TaskIdInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_worker_create(input: WorkerCreateInput) -> Result<String, String> {
+    let trust_config = worker_trust_config_for(&input.cwd, &input.trusted_roots)?;
     let worker = global_worker_registry().create(
         &input.cwd,
-        &input.trusted_roots,
+        trust_config,
         input.auto_recover_prompt_misdelivery,
     );
     to_pretty_json(worker)
+}
+
+fn worker_trust_config_for(cwd: &str, trusted_roots_override: &[String]) -> Result<TrustConfig, String> {
+    let runtime_config = ConfigLoader::default_for(cwd)
+        .load()
+        .map_err(|error| format!("failed to load runtime trust config: {error}"))?;
+    let mut trust_config = TrustConfig::new();
+
+    for path in runtime_config.trust().allowlist() {
+        trust_config = trust_config.with_allowlisted(path.clone());
+    }
+    for path in runtime_config.trust().denylist() {
+        trust_config = trust_config.with_denied(path.clone());
+    }
+    for path in trusted_roots_override {
+        trust_config = trust_config.with_allowlisted(path.clone());
+    }
+
+    Ok(trust_config)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1762,8 +1799,8 @@ fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
         return None;
     }
 
-    let branch = git_stdout(&["branch", "--show-current"])?;
-    let main_ref = resolve_main_ref(&branch)?;
+    let branch = current_branch_cwd()?;
+    let main_ref = resolve_main_ref_cwd(&branch)?;
     let freshness = check_freshness(&branch, &main_ref);
     match freshness {
         BranchFreshness::Fresh => None,
@@ -1813,38 +1850,6 @@ fn normalize_shell_command(command: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn resolve_main_ref(branch: &str) -> Option<String> {
-    let has_local_main = git_ref_exists("main");
-    let has_remote_main = git_ref_exists("origin/main");
-
-    if branch == "main" && has_remote_main {
-        Some("origin/main".to_string())
-    } else if has_local_main {
-        Some("main".to_string())
-    } else if has_remote_main {
-        Some("origin/main".to_string())
-    } else {
-        None
-    }
-}
-
-fn git_ref_exists(reference: &str) -> bool {
-    Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet", reference])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-fn git_stdout(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!stdout.is_empty()).then_some(stdout)
-}
-
 fn branch_divergence_output(
     command: &str,
     branch: &str,
@@ -1879,22 +1884,19 @@ fn branch_divergence_output(
         return_code_interpretation: Some("preflight_blocked:branch_divergence".to_string()),
         no_output_expected: Some(false),
         structured_content: Some(vec![serde_json::to_value(
-            LaneEvent::new(
-                LaneEventName::BranchStaleAgainstMain,
-                LaneEventStatus::Blocked,
+            LaneEvent::branch_stale_against_main(
                 iso8601_now(),
-            )
-            .with_failure_class(LaneFailureClass::BranchDivergence)
-            .with_detail(stderr.clone())
-            .with_data(json!({
-                "branch": branch,
-                "mainRef": main_ref,
-                "commitsBehind": commits_behind,
-                "commitsAhead": commits_ahead,
-                "missingCommits": missing_fixes,
-                "blockedCommand": command,
-                "recommendedAction": format!("merge or rebase {main_ref} before workspace tests")
-            })),
+                stderr.clone(),
+                json!({
+                    "branch": branch,
+                    "mainRef": main_ref,
+                    "commitsBehind": commits_behind,
+                    "commitsAhead": commits_ahead,
+                    "missingCommits": missing_fixes,
+                    "blockedCommand": command,
+                    "recommendedAction": format!("merge or rebase {main_ref} before workspace tests")
+                }),
+            ),
         )
         .expect("lane event should serialize")]),
         persisted_output_path: None,
@@ -2342,34 +2344,71 @@ struct SkillOutput {
     prompt: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AgentOutput {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentManifestSnapshot {
     #[serde(rename = "agentId")]
-    agent_id: String,
-    name: String,
-    description: String,
+    pub agent_id: String,
+    pub name: String,
+    pub description: String,
     #[serde(rename = "subagentType")]
-    subagent_type: Option<String>,
-    model: Option<String>,
-    status: String,
+    pub subagent_type: Option<String>,
+    pub model: Option<String>,
+    pub status: String,
     #[serde(rename = "outputFile")]
-    output_file: String,
+    pub output_file: String,
     #[serde(rename = "manifestFile")]
-    manifest_file: String,
+    pub manifest_file: String,
     #[serde(rename = "createdAt")]
-    created_at: String,
+    pub created_at: String,
     #[serde(rename = "startedAt", skip_serializing_if = "Option::is_none")]
-    started_at: Option<String>,
+    pub started_at: Option<String>,
     #[serde(rename = "completedAt", skip_serializing_if = "Option::is_none")]
-    completed_at: Option<String>,
+    pub completed_at: Option<String>,
     #[serde(rename = "laneEvents", default, skip_serializing_if = "Vec::is_empty")]
-    lane_events: Vec<LaneEvent>,
+    pub lane_events: Vec<LaneEvent>,
     #[serde(rename = "currentBlocker", skip_serializing_if = "Option::is_none")]
-    current_blocker: Option<LaneEventBlocker>,
+    pub current_blocker: Option<LaneEventBlocker>,
     #[serde(rename = "derivedState")]
-    derived_state: String,
+    pub derived_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub error: Option<String>,
+}
+
+type AgentOutput = AgentManifestSnapshot;
+
+#[derive(Debug, Deserialize)]
+struct AgentManifestToolOutput {
+    #[serde(rename = "agentId")]
+    agent_id: Option<String>,
+    #[serde(rename = "manifestFile")]
+    manifest_file: Option<String>,
+}
+
+pub fn load_agent_manifest(path: &Path) -> Result<AgentManifestSnapshot, String> {
+    let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    serde_json::from_str(&contents).map_err(|error| error.to_string())
+}
+
+pub fn load_agent_manifest_from_tool_output(output: &str) -> Result<AgentManifestSnapshot, String> {
+    let tool_output: AgentManifestToolOutput =
+        serde_json::from_str(output).map_err(|error| error.to_string())?;
+    let path = resolve_agent_manifest_path(
+        tool_output.manifest_file.as_deref(),
+        tool_output.agent_id.as_deref(),
+    )?;
+    load_agent_manifest(&path)
+}
+
+fn resolve_agent_manifest_path(
+    manifest_file: Option<&str>,
+    agent_id: Option<&str>,
+) -> Result<PathBuf, String> {
+    if let Some(path) = manifest_file.map(PathBuf::from) {
+        return Ok(path);
+    }
+
+    let agent_id = agent_id.ok_or_else(|| String::from("missing agent manifest reference"))?;
+    Ok(agent_store_dir()?.join(format!("{agent_id}.json")))
 }
 
 #[derive(Debug, Clone)]
@@ -3527,19 +3566,15 @@ fn persist_agent_terminal_state(
             .push(LaneEvent::failed(iso8601_now(), &blocker));
     } else {
         next_manifest.current_blocker = None;
+        next_manifest
+            .lane_events
+            .extend(infer_lane_events_from_result(result));
         let compressed_detail = result
             .filter(|value| !value.trim().is_empty())
             .map(|value| compress_summary_text(value.trim()));
         next_manifest
             .lane_events
             .push(LaneEvent::finished(iso8601_now(), compressed_detail));
-        if let Some(provenance) = maybe_commit_provenance(result) {
-            next_manifest.lane_events.push(LaneEvent::commit_created(
-                iso8601_now(),
-                Some(format!("commit {}", provenance.commit)),
-                provenance,
-            ));
-        }
     }
     write_agent_manifest(&next_manifest)
 }
@@ -3599,6 +3634,98 @@ fn maybe_commit_provenance(result: Option<&str>) -> Option<LaneCommitProvenance>
         superseded_by: None,
         lineage: vec![commit],
     })
+}
+
+fn infer_lane_events_from_result(result: Option<&str>) -> Vec<LaneEvent> {
+    let Some(result) = result.filter(|value| !value.trim().is_empty()) else {
+        return Vec::new();
+    };
+
+    let mut lane_events = Vec::new();
+
+    if let Some(test_status_event) = infer_test_status_lane_event(result) {
+        lane_events.push(test_status_event);
+    }
+
+    if let Some(provenance) = maybe_commit_provenance(Some(result)) {
+        lane_events.push(LaneEvent::commit_created(
+            iso8601_now(),
+            Some(format!("commit {}", provenance.commit)),
+            provenance,
+        ));
+    }
+
+    if let Some(pr_url) = extract_pull_request_url(result) {
+        lane_events.push(LaneEvent::pr_opened(
+            iso8601_now(),
+            Some(format!("opened PR {pr_url}")),
+            Some(json!({ "url": pr_url })),
+        ));
+    }
+
+    if is_explicit_merge_ready(result) {
+        lane_events.push(LaneEvent::merge_ready(
+            iso8601_now(),
+            Some("ready to merge".to_string()),
+        ));
+    }
+
+    lane_events
+}
+
+fn infer_test_status_lane_event(result: &str) -> Option<LaneEvent> {
+    let normalized = result.to_ascii_lowercase();
+    let red_signal = first_matching_signal(
+        &normalized,
+        &[
+            "tests failed",
+            "test failed",
+            "workspace red",
+            "build red",
+            "red status",
+        ],
+    );
+    let green_signal = first_matching_signal(
+        &normalized,
+        &[
+            "all tests passed",
+            "tests passed",
+            "workspace green",
+            "package green",
+            "targeted tests green",
+            "merge-ready green",
+            "green status",
+            "green build",
+        ],
+    );
+
+    match (red_signal, green_signal) {
+        (Some(_), Some(_)) | (None, None) => None,
+        (Some(detail), None) => Some(LaneEvent::red(iso8601_now(), Some(detail.to_string()))),
+        (None, Some(detail)) => Some(LaneEvent::green(iso8601_now(), Some(detail.to_string()))),
+    }
+}
+
+fn first_matching_signal<'a>(haystack: &'a str, signals: &[&'a str]) -> Option<&'a str> {
+    signals
+        .iter()
+        .copied()
+        .find(|signal| haystack.contains(signal))
+}
+
+fn extract_pull_request_url(result: &str) -> Option<String> {
+    result
+        .split_whitespace()
+        .map(|token| token.trim_matches(|ch: char| ",.;:()[]{}<>\"'".contains(ch)))
+        .find(|token| token.starts_with("https://github.com/") && token.contains("/pull/"))
+        .map(str::to_string)
+}
+
+fn is_explicit_merge_ready(result: &str) -> bool {
+    let normalized = result.to_ascii_lowercase();
+    normalized.contains("merge ready")
+        || normalized.contains("merge-ready")
+        || normalized.contains("ready to merge")
 }
 
 fn extract_commit_sha(result: &str) -> Option<String> {
@@ -3742,20 +3869,21 @@ impl ApiClient for ProviderRuntimeClient {
         };
 
         self.runtime.block_on(async {
-            let mut stream = self
-                .client
-                .stream_message(&message_request)
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let mut stream =
+                self.client
+                    .stream_message(&message_request)
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::new(error.to_string())
+                            .with_failure_class(error.to_failure_class())
+                    })?;
             let mut events = Vec::new();
             let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
             let mut saw_stop = false;
 
-            while let Some(event) = stream
-                .next_event()
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?
-            {
+            while let Some(event) = stream.next_event().await.map_err(|error| {
+                RuntimeError::new(error.to_string()).with_failure_class(error.to_failure_class())
+            })? {
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
                         for block in start.message.content {
@@ -3825,7 +3953,10 @@ impl ApiClient for ProviderRuntimeClient {
                     ..message_request.clone()
                 })
                 .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                .map_err(|error| {
+                    RuntimeError::new(error.to_string())
+                        .with_failure_class(error.to_failure_class())
+                })?;
             let mut events = response_to_events(response);
             push_prompt_cache_record(&self.client, &mut events);
             Ok(events)
@@ -5255,14 +5386,16 @@ mod tests {
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
         derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, SubagentToolExecutor,
+        infer_lane_events_from_result, maybe_commit_provenance, mvp_tool_specs,
+        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
+        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneFailureClass,
+        SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::{
-        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, BranchPolicy,
+        CommitPolicy, ConversationRuntime, LaneEventName, PermissionMode, PermissionPolicy,
+        ReportingContract, RuntimeError, Session, TaskPacket, TaskScope, ToolExecutor,
     };
     use serde_json::json;
 
@@ -5353,6 +5486,7 @@ mod tests {
 
     #[test]
     fn worker_tools_gate_prompt_delivery_until_ready_and_support_auto_trust() {
+        // given
         let created = execute_tool(
             "WorkerCreate",
             &json!({
@@ -5366,7 +5500,11 @@ mod tests {
             .as_str()
             .expect("worker id")
             .to_string();
+
+        // when / then
         assert_eq!(created_output["status"], "spawning");
+        assert_eq!(created_output["trust_state"], "pending");
+        assert_eq!(created_output["trust_policy"], "auto_trust");
         assert_eq!(created_output["trust_auto_resolve"], true);
 
         let gated = execute_tool(
@@ -5390,13 +5528,22 @@ mod tests {
         let observed_output: serde_json::Value = serde_json::from_str(&observed).expect("json");
         assert_eq!(observed_output["status"], "spawning");
         assert_eq!(observed_output["trust_gate_cleared"], true);
+        assert_eq!(observed_output["trust_state"], "resolved");
         assert_eq!(
             observed_output["events"][1]["payload"]["type"],
             "trust_prompt"
         );
         assert_eq!(
+            observed_output["events"][1]["payload"]["trust_state"],
+            "required"
+        );
+        assert_eq!(
             observed_output["events"][2]["payload"]["resolution"],
             "auto_allowlisted"
+        );
+        assert_eq!(
+            observed_output["events"][2]["payload"]["trust_state"],
+            "resolved"
         );
 
         let ready = execute_tool(
@@ -5430,9 +5577,101 @@ mod tests {
         )
         .expect("WorkerSendPrompt should succeed after ready");
         let accepted_output: serde_json::Value = serde_json::from_str(&accepted).expect("json");
-        assert_eq!(accepted_output["status"], "running");
+        assert_eq!(accepted_output["status"], "prompt_accepted");
         assert_eq!(accepted_output["prompt_delivery_attempts"], 1);
         assert_eq!(accepted_output["prompt_in_flight"], true);
+
+        let running = execute_tool(
+            "WorkerObserve",
+            &json!({
+                "worker_id": created_output["worker_id"],
+                "screen_text": "Thinking through the requested change"
+            }),
+        )
+        .expect("WorkerObserve should detect running cue");
+        let running_output: serde_json::Value = serde_json::from_str(&running).expect("json");
+        assert_eq!(running_output["status"], "running");
+    }
+
+    #[test]
+    fn worker_create_prefers_runtime_trust_config_and_keeps_override_seam() {
+        // given
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("worker-trust-config");
+        let home = root.join("home");
+        let cwd = root.join("cwd");
+        let repo = cwd.join("repo");
+        let blocked = cwd.join("blocked");
+        let override_repo = cwd.join("override");
+        std::fs::create_dir_all(home.join(".claw")).expect("home dir");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::create_dir_all(&blocked).expect("blocked dir");
+        std::fs::create_dir_all(&override_repo).expect("override dir");
+        std::fs::write(
+            home.join(".claw").join("settings.json"),
+            format!(
+                r#"{{
+              "trust": {{
+                "allowlist": ["{}"],
+                "denylist": ["{}"]
+              }}
+            }}"#,
+                Path::new("..").join("..").join("cwd").join("repo").display(),
+                Path::new("..").join("..").join("cwd").join("blocked").display()
+            ),
+        )
+        .expect("write trust settings");
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+
+        // when
+        let allowlisted = execute_tool(
+            "WorkerCreate",
+            &json!({
+                "cwd": repo.display().to_string()
+            }),
+        )
+        .expect("WorkerCreate should load allowlist from config");
+        let denylisted = execute_tool(
+            "WorkerCreate",
+            &json!({
+                "cwd": blocked.display().to_string()
+            }),
+        )
+        .expect("WorkerCreate should load denylist from config");
+        let override_only = execute_tool(
+            "WorkerCreate",
+            &json!({
+                "cwd": override_repo.display().to_string(),
+                "trusted_roots": [cwd.display().to_string()]
+            }),
+        )
+        .expect("WorkerCreate should still honor trusted_roots override");
+
+        // then
+        let allowlisted_output: serde_json::Value = serde_json::from_str(&allowlisted).expect("json");
+        let denylisted_output: serde_json::Value = serde_json::from_str(&denylisted).expect("json");
+        let override_output: serde_json::Value = serde_json::from_str(&override_only).expect("json");
+        assert_eq!(allowlisted_output["trust_policy"], "auto_trust");
+        assert_eq!(allowlisted_output["trust_auto_resolve"], true);
+        assert_eq!(denylisted_output["trust_policy"], "deny");
+        assert_eq!(denylisted_output["trust_auto_resolve"], false);
+        assert_eq!(override_output["trust_policy"], "auto_trust");
+        assert_eq!(override_output["trust_auto_resolve"], true);
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5497,7 +5736,7 @@ mod tests {
         )
         .expect("WorkerSendPrompt should replay recovered prompt");
         let replayed_output: serde_json::Value = serde_json::from_str(&replayed).expect("json");
-        assert_eq!(replayed_output["status"], "running");
+        assert_eq!(replayed_output["status"], "prompt_accepted");
         assert_eq!(replayed_output["prompt_delivery_attempts"], 2);
         assert_eq!(replayed_output["prompt_in_flight"], true);
     }
@@ -6508,14 +6747,14 @@ mod tests {
         );
         assert_eq!(
             completed_manifest_json["laneEvents"][1]["event"],
-            "lane.finished"
-        );
-        assert_eq!(
-            completed_manifest_json["laneEvents"][2]["event"],
             "lane.commit.created"
         );
         assert_eq!(
-            completed_manifest_json["laneEvents"][2]["data"]["commit"],
+            completed_manifest_json["laneEvents"][2]["event"],
+            "lane.finished"
+        );
+        assert_eq!(
+            completed_manifest_json["laneEvents"][1]["data"]["commit"],
             "abc1234"
         );
         assert!(completed_manifest_json["currentBlocker"].is_null());
@@ -6656,6 +6895,51 @@ mod tests {
         assert_eq!(provenance.canonical_commit.as_deref(), Some("deadbee"));
         assert_eq!(provenance.lineage, vec!["deadbee".to_string()]);
     }
+
+    #[test]
+    fn terminal_result_infers_green_pr_merge_ready_and_commit_events() {
+        // given
+        let result = concat!(
+            "All tests passed. ",
+            "Opened PR https://github.com/example/repo/pull/42. ",
+            "Ready to merge. ",
+            "Landed as commit deadbee."
+        );
+
+        // when
+        let lane_events = infer_lane_events_from_result(Some(result));
+
+        // then
+        assert_eq!(lane_events.len(), 4);
+        assert_eq!(lane_events[0].event, LaneEventName::Green);
+        assert_eq!(lane_events[0].detail.as_deref(), Some("all tests passed"));
+        assert_eq!(lane_events[1].event, LaneEventName::CommitCreated);
+        assert_eq!(
+            lane_events[1].data.as_ref().expect("commit data")["commit"],
+            "deadbee"
+        );
+        assert_eq!(lane_events[2].event, LaneEventName::PrOpened);
+        assert_eq!(
+            lane_events[2].data.as_ref().expect("pr data")["url"],
+            "https://github.com/example/repo/pull/42"
+        );
+        assert_eq!(lane_events[3].event, LaneEventName::MergeReady);
+    }
+
+    #[test]
+    fn terminal_result_stays_silent_when_red_and_green_signals_conflict() {
+        // given
+        let result = "tests failed earlier but all tests passed after rerun";
+
+        // when
+        let lane_events = infer_lane_events_from_result(Some(result));
+
+        // then
+        assert!(lane_events
+            .iter()
+            .all(|event| !matches!(event.event, LaneEventName::Red | LaneEventName::Green)));
+    }
+
     #[test]
     fn lane_failure_taxonomy_normalizes_common_blockers() {
         let cases = [
@@ -7773,24 +8057,30 @@ printf 'pwsh:%s' "$1"
     fn run_task_packet_creates_packet_backed_task() {
         let result = run_task_packet(TaskPacket {
             objective: "Ship packetized runtime task".to_string(),
-            scope: "runtime/task system".to_string(),
-            repo: "claw-code-parity".to_string(),
-            branch_policy: "origin/main only".to_string(),
+            scope: TaskScope::Workspace,
+            repo: Some(PathBuf::from("/tmp/claw-code-parity")),
+            worktree: Some(PathBuf::from("/tmp/claw-code-parity/.worktrees/runtime")),
+            branch_policy: BranchPolicy::AutoRebase,
             acceptance_tests: vec![
                 "cargo build --workspace".to_string(),
                 "cargo test --workspace".to_string(),
             ],
-            commit_policy: "single commit".to_string(),
-            reporting_contract: "print build/test result and sha".to_string(),
-            escalation_policy: "manual escalation".to_string(),
+            commit_policy: CommitPolicy::Required,
+            reporting_contract: ReportingContract::AcceptanceTestsAndCommit,
+            escalation_policy: runtime::EscalationPolicy::AlertHuman,
         })
         .expect("task packet should create a task");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["status"], "created");
         assert_eq!(output["prompt"], "Ship packetized runtime task");
-        assert_eq!(output["description"], "runtime/task system");
-        assert_eq!(output["task_packet"]["repo"], "claw-code-parity");
+        assert_eq!(output["description"], "workspace");
+        assert_eq!(output["task_packet"]["repo"], "/tmp/claw-code-parity");
+        assert_eq!(
+            output["task_packet"]["worktree"],
+            "/tmp/claw-code-parity/.worktrees/runtime"
+        );
+        assert_eq!(output["task_packet"]["scope"], "workspace");
         assert_eq!(
             output["task_packet"]["acceptance_tests"][1],
             "cargo test --workspace"

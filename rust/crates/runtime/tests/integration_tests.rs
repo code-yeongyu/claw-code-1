@@ -4,11 +4,17 @@
 //! These tests verify that adjacent modules in the runtime crate actually
 //! connect correctly — catching wiring gaps that unit tests miss.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use runtime::green_contract::{GreenContract, GreenContractOutcome, GreenLevel};
+use runtime::plugin_lifecycle::{PluginState, ServerHealth, ServerStatus};
+use runtime::recovery_recipes::{
+    attempt_recovery, FailureScenario, RecoveryContext, RecoveryEvent, RecoveryResult,
+};
 use runtime::{
-    apply_policy, BranchFreshness, DiffScope, LaneBlocker, LaneContext, PolicyAction,
+    apply_policy, BranchFreshness, DiffScope, LaneBlocker, LaneContext, LaneEventName,
+    LaneEventStatus, LaneFailureClass, McpDiscoveryFailure, McpLifecyclePhase, PolicyAction,
     PolicyCondition, PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus, StaleBranchAction,
     StaleBranchPolicy,
 };
@@ -21,7 +27,7 @@ fn stale_branch_detection_flows_into_policy_engine() {
     // given — a stale branch context (2 hours behind main, threshold is 1 hour)
     let stale_context = LaneContext::new(
         "stale-lane",
-        0,
+        None,
         Duration::from_secs(2 * 60 * 60), // 2 hours stale
         LaneBlocker::None,
         ReviewStatus::Pending,
@@ -48,7 +54,7 @@ fn stale_branch_detection_flows_into_policy_engine() {
 fn fresh_branch_does_not_trigger_stale_policy() {
     let fresh_context = LaneContext::new(
         "fresh-lane",
-        0,
+        None,
         Duration::from_secs(30 * 60), // 30 min stale — under 1 hour threshold
         LaneBlocker::None,
         ReviewStatus::Pending,
@@ -88,7 +94,7 @@ fn green_contract_satisfied_allows_merge() {
 fn green_contract_unsatisfied_blocks_merge() {
     let context = LaneContext::new(
         "partial-green-lane",
-        1, // GreenLevel::Package as u8
+        Some(GreenLevel::Package),
         Duration::from_secs(0),
         LaneBlocker::None,
         ReviewStatus::Pending,
@@ -96,18 +102,17 @@ fn green_contract_unsatisfied_blocks_merge() {
         false,
     );
 
-    // This is a conceptual test — we need a way to express "requires workspace green"
-    // Currently LaneContext has raw green_level: u8, not a contract
-    // For now we just verify the policy condition works
     let engine = PolicyEngine::new(vec![PolicyRule::new(
         "workspace-green-required",
-        PolicyCondition::GreenAt { level: 3 }, // GreenLevel::Workspace
+        PolicyCondition::GreenAt {
+            level: GreenLevel::Workspace,
+        },
         PolicyAction::MergeToDev,
         10,
     )]);
 
     let actions = engine.evaluate(&context);
-    assert!(actions.is_empty()); // level 1 < 3, so no merge
+    assert!(actions.is_empty());
 }
 
 /// reconciliation + policy_engine integration:
@@ -212,7 +217,7 @@ fn end_to_end_stale_lane_gets_merge_forward_action() {
     // when: build context and evaluate policy
     let context = LaneContext::new(
         "lane-9411",
-        3,                                // Workspace green
+        Some(GreenLevel::Workspace),
         Duration::from_secs(5 * 60 * 60), // 5 hours stale, definitely over threshold
         LaneBlocker::None,
         ReviewStatus::Approved,
@@ -261,7 +266,7 @@ fn end_to_end_stale_lane_gets_merge_forward_action() {
 fn fresh_approved_lane_gets_merge_action() {
     let context = LaneContext::new(
         "fresh-approved-lane",
-        3,                            // Workspace green
+        Some(GreenLevel::Workspace),
         Duration::from_secs(30 * 60), // 30 min — under 1 hour threshold = fresh
         LaneBlocker::None,
         ReviewStatus::Approved,
@@ -272,7 +277,9 @@ fn fresh_approved_lane_gets_merge_action() {
     let engine = PolicyEngine::new(vec![PolicyRule::new(
         "merge-if-green-approved-not-stale",
         PolicyCondition::And(vec![
-            PolicyCondition::GreenAt { level: 3 },
+            PolicyCondition::GreenAt {
+                level: GreenLevel::Workspace,
+            },
             PolicyCondition::ReviewPassed,
             // NOT PolicyCondition::StaleBranch — fresh lanes bypass this
         ]),
@@ -297,7 +304,7 @@ fn worker_provider_failure_flows_through_recovery_to_policy() {
 
     // given — a worker that encounters a provider failure during session completion
     let registry = WorkerRegistry::new();
-    let worker = registry.create("/tmp/repo-recovery-test", &[], true);
+    let worker = registry.create("/tmp/repo-recovery-test", runtime::TrustConfig::new(), true);
 
     // Worker reaches ready state
     registry
@@ -346,7 +353,7 @@ fn worker_provider_failure_flows_through_recovery_to_policy() {
     // Policy integration: recovery success + green status = merge-ready
     // (Simulating the policy check that would happen after successful recovery)
     let recovery_success = matches!(result, RecoveryResult::Recovered { .. });
-    let green_level = 3; // Workspace green
+    let green_level = Some(GreenLevel::Workspace);
     let not_stale = Duration::from_secs(30 * 60); // 30 min — fresh
 
     let post_recovery_context = LaneContext::new(
@@ -364,7 +371,9 @@ fn worker_provider_failure_flows_through_recovery_to_policy() {
         PolicyRule::new(
             "merge-after-successful-recovery",
             PolicyCondition::And(vec![
-                PolicyCondition::GreenAt { level: 3 },
+                PolicyCondition::GreenAt {
+                    level: GreenLevel::Workspace,
+                },
                 PolicyCondition::ReviewPassed,
             ]),
             PolicyAction::MergeToDev,
@@ -383,4 +392,151 @@ fn worker_provider_failure_flows_through_recovery_to_policy() {
         vec![PolicyAction::MergeToDev],
         "post-recovery green+approved lane should be merge-ready"
     );
+}
+
+/// stale_branch -> FailureScenario -> recovery -> lane event integration:
+/// A stale branch should produce a StaleBranch scenario, recover via
+/// rebase+clean-build, and convert to a lane.recovery_attempted event.
+#[test]
+fn stale_branch_flows_through_recovery_to_lane_event() {
+    // given — a branch that is stale against main
+    let freshness = BranchFreshness::Stale {
+        commits_behind: 3,
+        missing_fixes: vec!["fix-timeout".to_string()],
+    };
+
+    // when — derive failure scenario from branch freshness
+    let scenario = FailureScenario::from_branch_freshness(&freshness)
+        .expect("stale branch should produce a failure scenario");
+    assert_eq!(scenario, FailureScenario::StaleBranch);
+
+    // when — attempt recovery
+    let mut ctx = RecoveryContext::new();
+    let result = attempt_recovery(&scenario, &mut ctx);
+    assert!(
+        matches!(result, RecoveryResult::Recovered { steps_taken: 2 }),
+        "stale branch recipe has rebase + clean build = 2 steps, got: {result:?}"
+    );
+
+    // when — convert recovery event to lane event
+    let recovery_event = ctx
+        .events()
+        .iter()
+        .find(|e| matches!(e, RecoveryEvent::RecoveryAttempted { .. }))
+        .expect("should have RecoveryAttempted event")
+        .clone();
+    let lane_event = recovery_event
+        .into_lane_event("2026-05-01T00:00:00Z")
+        .expect("RecoveryAttempted should convert to LaneEvent");
+
+    // then — lane event carries correct schema
+    assert_eq!(lane_event.event, LaneEventName::RecoveryAttempted);
+    assert_eq!(lane_event.status, LaneEventStatus::Recovering);
+    assert_eq!(
+        lane_event.failure_class,
+        Some(LaneFailureClass::BranchDivergence)
+    );
+    let data = lane_event.data.expect("should have structured data");
+    assert_eq!(data["scenario"], "stale_branch");
+    assert!(!data["recipe"]["steps"].as_array().unwrap().is_empty());
+}
+
+/// mcp_discovery_failure -> FailureScenario -> recovery -> lane event integration:
+/// An MCP handshake failure should bridge to McpHandshakeFailure, recover
+/// via retry, and convert to a lane.recovery_attempted event.
+#[test]
+fn mcp_discovery_failure_flows_through_recovery_to_lane_event() {
+    // given — an MCP discovery failure during initialization
+    let failure = McpDiscoveryFailure {
+        server_name: "broken-server".to_string(),
+        phase: McpLifecyclePhase::InitializeHandshake,
+        error: "connection refused".to_string(),
+        recoverable: true,
+        context: BTreeMap::new(),
+    };
+
+    // when — derive failure scenario
+    let scenario = FailureScenario::from_mcp_discovery_failure(&failure);
+    assert_eq!(scenario, FailureScenario::McpHandshakeFailure);
+
+    // when — attempt recovery
+    let mut ctx = RecoveryContext::new();
+    let result = attempt_recovery(&scenario, &mut ctx);
+    assert!(
+        matches!(result, RecoveryResult::Recovered { steps_taken: 1 }),
+        "MCP handshake recipe retries once, got: {result:?}"
+    );
+
+    // when — convert to lane event
+    let recovery_event = ctx
+        .events()
+        .iter()
+        .find(|e| matches!(e, RecoveryEvent::RecoveryAttempted { .. }))
+        .expect("should have RecoveryAttempted event")
+        .clone();
+    let lane_event = recovery_event
+        .into_lane_event("2026-05-01T00:00:00Z")
+        .expect("RecoveryAttempted should convert to LaneEvent");
+
+    // then
+    assert_eq!(lane_event.event, LaneEventName::RecoveryAttempted);
+    assert_eq!(lane_event.status, LaneEventStatus::Recovering);
+    assert_eq!(
+        lane_event.failure_class,
+        Some(LaneFailureClass::McpHandshake)
+    );
+    let data = lane_event.data.expect("should have structured data");
+    assert_eq!(data["scenario"], "mcp_handshake_failure");
+}
+
+/// plugin_state(Degraded) -> FailureScenario -> recovery -> lane event integration:
+/// A degraded plugin should bridge to PartialPluginStartup, recover via
+/// restart+handshake, and convert to a lane.recovery_attempted event.
+#[test]
+fn plugin_degraded_flows_through_recovery_to_lane_event() {
+    // given — a plugin in degraded state with one failed server
+    let state = PluginState::Degraded {
+        healthy_servers: vec!["alpha".to_string()],
+        failed_servers: vec![ServerHealth {
+            server_name: "beta".to_string(),
+            status: ServerStatus::Failed,
+            capabilities: vec!["write".to_string()],
+            last_error: Some("timeout".to_string()),
+        }],
+    };
+
+    // when — derive failure scenario from plugin state
+    let scenario = FailureScenario::from_plugin_state(&state)
+        .expect("degraded plugin should produce a failure scenario");
+    assert_eq!(scenario, FailureScenario::PartialPluginStartup);
+
+    // when — attempt recovery
+    let mut ctx = RecoveryContext::new();
+    let result = attempt_recovery(&scenario, &mut ctx);
+    assert!(
+        matches!(result, RecoveryResult::Recovered { steps_taken: 2 }),
+        "partial plugin recipe has restart + handshake = 2 steps, got: {result:?}"
+    );
+
+    // when — convert to lane event
+    let recovery_event = ctx
+        .events()
+        .iter()
+        .find(|e| matches!(e, RecoveryEvent::RecoveryAttempted { .. }))
+        .expect("should have RecoveryAttempted event")
+        .clone();
+    let lane_event = recovery_event
+        .into_lane_event("2026-05-01T00:00:00Z")
+        .expect("RecoveryAttempted should convert to LaneEvent");
+
+    // then
+    assert_eq!(lane_event.event, LaneEventName::RecoveryAttempted);
+    assert_eq!(lane_event.status, LaneEventStatus::Recovering);
+    assert_eq!(
+        lane_event.failure_class,
+        Some(LaneFailureClass::PluginStartup)
+    );
+    let data = lane_event.data.expect("should have structured data");
+    assert_eq!(data["scenario"], "partial_plugin_startup");
+    assert_eq!(data["result"]["recovered"]["steps_taken"], 2);
 }

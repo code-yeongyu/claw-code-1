@@ -90,13 +90,14 @@ Acceptance:
 - trust prompt state is detectable and emitted
 - shell misdelivery becomes detectable as a first-class failure state
 
-### 2. Trust prompt resolver
+### 2. Trust prompt resolver — done
 Add allowlisted auto-trust behavior for known repos/worktrees.
 
 Acceptance:
 - trusted repos auto-clear trust prompts
 - events emitted for `trust_required` and `trust_resolved`
 - non-allowlisted repos remain gated
+- config-backed `trust.allowlist` / `trust.denylist` accumulate across discovered `.claw/settings*.json` entries with per-file relative path resolution
 
 ### 3. Structured session control API
 Provide machine control above tmux:
@@ -132,7 +133,7 @@ Acceptance:
 - clawhip consumes typed lane events
 - Discord summaries are rendered from structured events instead of pane scraping alone
 
-### 5. Failure taxonomy
+### 5. Failure taxonomy — **done**
 Normalize failure classes:
 - `prompt_delivery`
 - `trust_gate`
@@ -149,6 +150,7 @@ Normalize failure classes:
 Acceptance:
 - blockers are machine-classified
 - dashboards and retry policies can branch on failure type
+- **done**: the canonical claw-level taxonomy now exists as `FailureClass`/`LaneFailureClass`, API errors map into it via `to_failure_class()`, doctor JSON checks expose `failure_class` where classification is meaningful, and session `turn_failed` traces retain the machine-readable class.
 
 ### 6. Actionable summary compression
 Collapse noisy event streams into:
@@ -163,15 +165,16 @@ Acceptance:
 
 ## Phase 3 — Branch/Test Awareness and Auto-Recovery
 
-### 7. Stale-branch detection before broad verification
+### 7. Stale-branch detection before broad verification — **done**
 Before broad test runs, compare current branch to `main` and detect if known fixes are missing.
 
 Acceptance:
 - emit `branch.stale_against_main`
 - suggest or auto-run rebase/merge-forward according to policy
 - avoid misclassifying stale-branch failures as new regressions
+- **done**: reusable `resolve_main_ref`/`current_branch` helpers in `runtime::stale_branch`, broad-test preflight in `tools/src/lib.rs` delegates to runtime helpers, `claw status --output-format json` and `claw doctor --output-format json` expose `stale_against_main` and `missing_commits_count` on the workspace surface, text status/doctor output includes stale info, and doctor workspace check uses warning level for stale branches.
 
-### 8. Recovery recipes for common failures
+### 8. Recovery recipes for common failures — **done**
 Encode known automatic recoveries for:
 - trust prompt unresolved
 - prompt delivered to shell
@@ -181,8 +184,8 @@ Encode known automatic recoveries for:
 - partial plugin startup
 
 Acceptance:
-- one automatic recovery attempt occurs before escalation
-- the attempted recovery is itself emitted as structured event data
+- one automatic recovery attempt occurs before escalation — **done**: `attempt_recovery()` enforces `max_attempts` then escalates
+- the attempted recovery is itself emitted as structured event data — **done**: `RecoveryEvent::RecoveryAttempted` converts to canonical `lane.recovery_attempted` `LaneEvent` with scenario/recipe/result JSON payload; cross-module bridges from `BranchFreshness`, `McpDiscoveryFailure`, and `PluginState` into `FailureScenario` → `LaneFailureClass` → lane event
 
 ### 9. Green-ness contract
 Workers should distinguish:
@@ -197,7 +200,7 @@ Acceptance:
 
 ## Phase 4 — Claws-First Task Execution
 
-### 10. Typed task packet format
+### 10. Typed task packet format — **done**
 Define a structured task packet with fields like:
 - objective
 - scope
@@ -211,6 +214,7 @@ Define a structured task packet with fields like:
 Acceptance:
 - claws can dispatch work without relying on long natural-language prompt blobs alone
 - task packets can be logged, retried, and transformed safely
+- **Done:** `TaskPacket` now uses typed serde enums plus optional `repo`/`worktree` paths in `rust/crates/runtime/src/task_packet.rs`, `RunTaskPacket` exposes the typed schema, and `claw task create --from-json <path|->` / `claw task validate <path|->` provide direct local text/JSON packet handling.
 
 ### 11. Policy engine for autonomous coding
 Encode automation rules such as:
@@ -292,11 +296,11 @@ Priority order: P0 = blocks CI/green state, P1 = blocks integration wiring, P2 =
 **P2 — Clawability hardening (original backlog)**
 5. Worker readiness handshake + trust resolution — **done**: `WorkerStatus` state machine with `Spawning` → `TrustRequired` → `ReadyForPrompt` → `PromptAccepted` → `Running` lifecycle, `trust_auto_resolve` + `trust_gate_cleared` gating
 6. Prompt misdelivery detection and recovery — **done**: `prompt_delivery_attempts` counter, `PromptMisdelivery` event detection, `auto_recover_prompt_misdelivery` + `replay_prompt` recovery arm
-7. Canonical lane event schema in clawhip — **done**: `LaneEvent` enum with `Started/Blocked/Failed/Finished` variants, `LaneEvent::new()` typed constructor, `tools/src/lib.rs` integration
+7. Canonical lane event schema in clawhip — **done**: `runtime::lane_events` now owns the canonical typed lane event schema and serde wire names for `lane.started`, `lane.ready`, `lane.prompt_misdelivery`, `lane.blocked`, `lane.red`, `lane.green`, `lane.commit.created`, `lane.pr.opened`, `lane.merge.ready`, `lane.finished`, `lane.failed`, and `branch.stale_against_main`; `tools/src/lib.rs` emits typed manifest events for stale-branch, commit, finish, and high-confidence green/red/PR/merge-ready signals, and `worker_boot` exposes a narrow worker→lane bridge for ready + prompt-misdelivery lifecycle events with round-trip serialization coverage.
 8. Failure taxonomy + blocker normalization — **done**: `WorkerFailureKind` enum (`TrustGate/PromptDelivery/Protocol/Provider`), `FailureScenario::from_worker_failure_kind()` bridge to recovery recipes
 9. Stale-branch detection before workspace tests — **done**: `stale_branch.rs` module with freshness detection, behind/ahead metrics, policy integration
 10. MCP structured degraded-startup reporting — **done**: `McpManager` degraded-startup reporting (+183 lines in `mcp_stdio.rs`), failed server classification (startup/handshake/config/partial), structured `failed_servers` + `recovery_recommendations` in tool output
-11. Structured task packet format — **done**: `task_packet.rs` module with `TaskPacket` struct, validation, serialization, `TaskScope` resolution (workspace/module/single-file/custom), integrated into `tools/src/lib.rs`
+11. Structured task packet format — **done**: `task_packet.rs` now uses typed serde enums (`scope`, `branch_policy`, `commit_policy`, `reporting_contract`, `escalation_policy`) plus optional `repo`/`worktree` paths, validation rejects blank objectives/tests, `tools/src/lib.rs` advertises the typed `RunTaskPacket` schema, and `claw task create|validate` exposes the packet format directly for local automation.
 12. Lane board / machine-readable status API — **done**: Lane completion hardening + `LaneContext::completed` auto-detection + MCP degraded reporting surface machine-readable state
 13. **Session completion failure classification** — **done**: `WorkerFailureKind::Provider` + `observe_completion()` + recovery recipe bridge landed
 14. **Config merge validation gap** — **done**: `config.rs` hook validation before deep-merge (+56 lines), malformed entries fail with source-path context instead of merged parse errors

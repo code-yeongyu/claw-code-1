@@ -10,6 +10,11 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::lane_events::{LaneEvent, LaneFailureClass};
+use crate::mcp_lifecycle_hardened::McpLifecyclePhase;
+use crate::mcp_stdio::McpDiscoveryFailure;
+use crate::plugin_lifecycle::PluginState;
+use crate::stale_branch::BranchFreshness;
 use crate::worker_boot::WorkerFailureKind;
 
 /// The six failure scenarios that have known recovery recipes.
@@ -49,6 +54,53 @@ impl FailureScenario {
             WorkerFailureKind::PromptDelivery => Self::PromptMisdelivery,
             WorkerFailureKind::Protocol => Self::McpHandshakeFailure,
             WorkerFailureKind::Provider => Self::ProviderFailure,
+        }
+    }
+
+    /// Derive a `FailureScenario` from branch freshness.
+    /// Returns `None` when the branch is fresh.
+    #[must_use]
+    pub fn from_branch_freshness(freshness: &BranchFreshness) -> Option<Self> {
+        match freshness {
+            BranchFreshness::Fresh => None,
+            BranchFreshness::Stale { .. } | BranchFreshness::Diverged { .. } => {
+                Some(Self::StaleBranch)
+            }
+        }
+    }
+
+    /// Derive a `FailureScenario` from an MCP discovery failure.
+    #[must_use]
+    pub fn from_mcp_discovery_failure(failure: &McpDiscoveryFailure) -> Self {
+        match failure.phase {
+            McpLifecyclePhase::InitializeHandshake => Self::McpHandshakeFailure,
+            _ => Self::McpHandshakeFailure,
+        }
+    }
+
+    /// Derive a `FailureScenario` from plugin state.
+    /// Returns `Some` for `Degraded` and `Failed` states.
+    #[must_use]
+    pub fn from_plugin_state(state: &PluginState) -> Option<Self> {
+        match state {
+            PluginState::Degraded { .. } | PluginState::Failed { .. } => {
+                Some(Self::PartialPluginStartup)
+            }
+            _ => None,
+        }
+    }
+
+    /// Map this scenario to the canonical `LaneFailureClass` for lane events.
+    #[must_use]
+    pub fn to_lane_failure_class(self) -> LaneFailureClass {
+        match self {
+            Self::TrustPromptUnresolved => LaneFailureClass::TrustGate,
+            Self::PromptMisdelivery => LaneFailureClass::PromptDelivery,
+            Self::StaleBranch => LaneFailureClass::BranchDivergence,
+            Self::CompileRedCrossCrate => LaneFailureClass::Compile,
+            Self::McpHandshakeFailure => LaneFailureClass::McpHandshake,
+            Self::PartialPluginStartup => LaneFailureClass::PluginStartup,
+            Self::ProviderFailure => LaneFailureClass::GatewayRouting,
         }
     }
 }
@@ -129,6 +181,34 @@ pub enum RecoveryEvent {
     RecoverySucceeded,
     RecoveryFailed,
     Escalated,
+}
+
+impl RecoveryEvent {
+    /// Convert a `RecoveryAttempted` variant into a canonical `LaneEvent`.
+    /// Returns `None` for other variants.
+    #[must_use]
+    pub fn into_lane_event(self, emitted_at: impl Into<String>) -> Option<LaneEvent> {
+        match self {
+            Self::RecoveryAttempted {
+                scenario,
+                recipe,
+                result,
+            } => {
+                let failure_class = scenario.to_lane_failure_class();
+                let data = serde_json::json!({
+                    "scenario": scenario,
+                    "recipe": recipe,
+                    "result": result,
+                });
+                Some(LaneEvent::recovery_attempted(
+                    emitted_at,
+                    failure_class,
+                    data,
+                ))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Minimal context for tracking recovery state and emitting events.
@@ -627,5 +707,203 @@ mod tests {
             .events()
             .iter()
             .any(|e| matches!(e, RecoveryEvent::Escalated)));
+    }
+
+    #[test]
+    fn branch_freshness_stale_maps_to_stale_branch_scenario() {
+        // given
+        let freshness = BranchFreshness::Stale {
+            commits_behind: 3,
+            missing_fixes: vec!["fix-timeout".to_string()],
+        };
+
+        // when
+        let scenario = FailureScenario::from_branch_freshness(&freshness);
+
+        // then
+        assert_eq!(scenario, Some(FailureScenario::StaleBranch));
+    }
+
+    #[test]
+    fn branch_freshness_diverged_maps_to_stale_branch_scenario() {
+        // given
+        let freshness = BranchFreshness::Diverged {
+            ahead: 2,
+            behind: 5,
+            missing_fixes: vec![],
+        };
+
+        // when
+        let scenario = FailureScenario::from_branch_freshness(&freshness);
+
+        // then
+        assert_eq!(scenario, Some(FailureScenario::StaleBranch));
+    }
+
+    #[test]
+    fn branch_freshness_fresh_returns_none() {
+        // given
+        let freshness = BranchFreshness::Fresh;
+
+        // when
+        let scenario = FailureScenario::from_branch_freshness(&freshness);
+
+        // then
+        assert_eq!(scenario, None);
+    }
+
+    #[test]
+    fn mcp_discovery_failure_maps_to_mcp_handshake_scenario() {
+        // given
+        let failure = McpDiscoveryFailure {
+            server_name: "broken-server".to_string(),
+            phase: crate::mcp_lifecycle_hardened::McpLifecyclePhase::InitializeHandshake,
+            error: "connection refused".to_string(),
+            recoverable: true,
+            context: std::collections::BTreeMap::new(),
+        };
+
+        // when
+        let scenario = FailureScenario::from_mcp_discovery_failure(&failure);
+
+        // then
+        assert_eq!(scenario, FailureScenario::McpHandshakeFailure);
+    }
+
+    #[test]
+    fn mcp_discovery_failure_non_handshake_phase_maps_to_mcp_handshake_scenario() {
+        // given
+        let failure = McpDiscoveryFailure {
+            server_name: "slow-server".to_string(),
+            phase: crate::mcp_lifecycle_hardened::McpLifecyclePhase::ToolDiscovery,
+            error: "timeout".to_string(),
+            recoverable: true,
+            context: std::collections::BTreeMap::new(),
+        };
+
+        // when
+        let scenario = FailureScenario::from_mcp_discovery_failure(&failure);
+
+        // then
+        assert_eq!(scenario, FailureScenario::McpHandshakeFailure);
+    }
+
+    #[test]
+    fn plugin_state_degraded_maps_to_partial_plugin_startup() {
+        // given
+        let state = PluginState::Degraded {
+            healthy_servers: vec!["alpha".to_string()],
+            failed_servers: vec![],
+        };
+
+        // when
+        let scenario = FailureScenario::from_plugin_state(&state);
+
+        // then
+        assert_eq!(scenario, Some(FailureScenario::PartialPluginStartup));
+    }
+
+    #[test]
+    fn plugin_state_failed_maps_to_partial_plugin_startup() {
+        // given
+        let state = PluginState::Failed {
+            reason: "all servers down".to_string(),
+        };
+
+        // when
+        let scenario = FailureScenario::from_plugin_state(&state);
+
+        // then
+        assert_eq!(scenario, Some(FailureScenario::PartialPluginStartup));
+    }
+
+    #[test]
+    fn plugin_state_healthy_returns_none() {
+        // given / when
+        let scenario = FailureScenario::from_plugin_state(&PluginState::Healthy);
+
+        // then
+        assert_eq!(scenario, None);
+    }
+
+    #[test]
+    fn failure_scenario_maps_to_lane_failure_class() {
+        // given / when / then
+        assert_eq!(
+            FailureScenario::TrustPromptUnresolved.to_lane_failure_class(),
+            crate::lane_events::LaneFailureClass::TrustGate,
+        );
+        assert_eq!(
+            FailureScenario::PromptMisdelivery.to_lane_failure_class(),
+            crate::lane_events::LaneFailureClass::PromptDelivery,
+        );
+        assert_eq!(
+            FailureScenario::StaleBranch.to_lane_failure_class(),
+            crate::lane_events::LaneFailureClass::BranchDivergence,
+        );
+        assert_eq!(
+            FailureScenario::CompileRedCrossCrate.to_lane_failure_class(),
+            crate::lane_events::LaneFailureClass::Compile,
+        );
+        assert_eq!(
+            FailureScenario::McpHandshakeFailure.to_lane_failure_class(),
+            crate::lane_events::LaneFailureClass::McpHandshake,
+        );
+        assert_eq!(
+            FailureScenario::PartialPluginStartup.to_lane_failure_class(),
+            crate::lane_events::LaneFailureClass::PluginStartup,
+        );
+        assert_eq!(
+            FailureScenario::ProviderFailure.to_lane_failure_class(),
+            crate::lane_events::LaneFailureClass::GatewayRouting,
+        );
+    }
+
+    #[test]
+    fn recovery_attempted_converts_to_lane_event_with_structured_data() {
+        // given
+        let mut ctx = RecoveryContext::new();
+        attempt_recovery(&FailureScenario::StaleBranch, &mut ctx);
+        let event = ctx
+            .events()
+            .iter()
+            .find(|e| matches!(e, RecoveryEvent::RecoveryAttempted { .. }))
+            .expect("should have RecoveryAttempted event")
+            .clone();
+
+        // when
+        let lane_event = event
+            .into_lane_event("2026-05-01T00:00:00Z")
+            .expect("RecoveryAttempted should produce a LaneEvent");
+
+        // then
+        assert_eq!(
+            lane_event.event,
+            crate::lane_events::LaneEventName::RecoveryAttempted
+        );
+        assert_eq!(
+            lane_event.status,
+            crate::lane_events::LaneEventStatus::Recovering
+        );
+        assert_eq!(
+            lane_event.failure_class,
+            Some(crate::lane_events::LaneFailureClass::BranchDivergence)
+        );
+        let data = lane_event.data.expect("should carry structured data");
+        assert_eq!(data["scenario"], "stale_branch");
+        assert!(!data["recipe"]["steps"].as_array().unwrap().is_empty());
+        assert!(data["result"]["recovered"].is_object());
+    }
+
+    #[test]
+    fn recovery_succeeded_does_not_convert_to_lane_event() {
+        // given
+        let event = RecoveryEvent::RecoverySucceeded;
+
+        // when
+        let lane_event = event.into_lane_event("2026-05-01T00:00:00Z");
+
+        // then
+        assert!(lane_event.is_none());
     }
 }

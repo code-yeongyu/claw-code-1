@@ -5,8 +5,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use runtime::ContentBlock;
-use runtime::Session;
+use runtime::{ContentBlock, ConversationMessage, Session, WorkerRegistry};
 use serde_json::Value;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -273,6 +272,81 @@ fn resumed_status_command_emits_structured_json_when_requested() {
     assert!(parsed["workspace"]["changed_files"].is_number());
     assert_eq!(parsed["workspace"]["loaded_config_files"].as_u64(), Some(0));
     assert!(parsed["sandbox"]["filesystem_mode"].as_str().is_some());
+    assert_eq!(parsed["workers"]["source"], "resumed_session");
+    assert!(parsed["workers"]["items"].is_array());
+}
+
+#[test]
+fn resumed_status_command_reconstructs_worker_snapshots_from_session_tool_results() {
+    // given
+    let temp_dir = unique_temp_dir("resume-status-workers-json");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+
+    let registry = WorkerRegistry::new();
+    let worker = registry.create("/tmp/repo-worker-status", runtime::TrustConfig::new(), true);
+    let running = registry
+        .observe(&worker.worker_id, "Ready for your input\n>")
+        .expect("ready observe should succeed");
+    let running = registry
+        .send_prompt(&running.worker_id, Some("reconstruct worker snapshot"))
+        .expect("prompt send should succeed");
+    let running = registry
+        .observe(&running.worker_id, "Thinking through reconstruction")
+        .expect("running cue observe should succeed");
+
+    let mut session = Session::new();
+    session
+        .push_user_text("resume status json fixture")
+        .expect("session write should succeed");
+    session
+        .push_message(ConversationMessage::tool_result(
+            "toolu_worker_snapshot",
+            "WorkerObserve",
+            serde_json::to_string_pretty(&running).expect("worker should serialize"),
+            false,
+        ))
+        .expect("worker snapshot should persist");
+    session
+        .save_to_path(&session_path)
+        .expect("session should persist");
+
+    // when
+    let output = run_claw(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 path"),
+            "/status",
+        ],
+    );
+
+    // then
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let parsed: Value =
+        serde_json::from_str(stdout.trim()).expect("resume status output should be json");
+    assert_eq!(parsed["workers"]["source"], "resumed_session");
+    assert_eq!(parsed["workers"]["count"], 1);
+    assert_eq!(
+        parsed["workers"]["items"][0]["worker_id"],
+        running.worker_id
+    );
+    assert_eq!(parsed["workers"]["items"][0]["status"], "running");
+    assert_eq!(parsed["workers"]["items"][0]["lifecycle_state"], "running");
+    assert_eq!(parsed["workers"]["items"][0]["blocked"], false);
+    assert_eq!(
+        parsed["workers"]["items"][0]["latest_event"]["kind"],
+        "running"
+    );
 }
 
 #[test]

@@ -9,8 +9,8 @@
 //! - Code pushed (has output file)
 
 use runtime::{
-    evaluate, LaneBlocker, LaneContext, PolicyAction, PolicyCondition, PolicyEngine, PolicyRule,
-    ReviewStatus,
+    evaluate, GreenLevel, LaneBlocker, LaneContext, PolicyAction, PolicyCondition, PolicyEngine,
+    PolicyRule, ReviewStatus,
 };
 
 use crate::AgentOutput;
@@ -55,7 +55,7 @@ pub(crate) fn detect_lane_completion(
     // All conditions met — create completed context
     Some(LaneContext {
         lane_id: output.agent_id.clone(),
-        green_level: 3, // Workspace green
+        green_level: Some(GreenLevel::Workspace),
         branch_freshness: std::time::Duration::from_secs(0),
         blocker: LaneBlocker::None,
         review_status: ReviewStatus::Approved,
@@ -73,7 +73,9 @@ pub(crate) fn evaluate_completed_lane(context: &LaneContext) -> Vec<PolicyAction
             "closeout-completed-lane",
             PolicyCondition::And(vec![
                 PolicyCondition::LaneCompleted,
-                PolicyCondition::GreenAt { level: 3 },
+                PolicyCondition::GreenAt {
+                    level: GreenLevel::Workspace,
+                },
             ]),
             PolicyAction::CloseoutLane,
             10,
@@ -92,7 +94,7 @@ pub(crate) fn evaluate_completed_lane(context: &LaneContext) -> Vec<PolicyAction
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime::{DiffScope, LaneBlocker};
+    use runtime::{DiffScope, GreenLevel, LaneBlocker};
 
     fn test_output() -> AgentOutput {
         AgentOutput {
@@ -122,7 +124,7 @@ mod tests {
         assert!(result.is_some());
         let context = result.unwrap();
         assert!(context.completed);
-        assert_eq!(context.green_level, 3);
+        assert_eq!(context.green_level, Some(GreenLevel::Workspace));
         assert_eq!(context.blocker, LaneBlocker::None);
     }
 
@@ -164,7 +166,7 @@ mod tests {
     fn evaluate_triggers_closeout_for_completed_lane() {
         let context = LaneContext {
             lane_id: "completed-lane".to_string(),
-            green_level: 3,
+            green_level: Some(GreenLevel::Workspace),
             branch_freshness: std::time::Duration::from_secs(0),
             blocker: LaneBlocker::None,
             review_status: ReviewStatus::Approved,
