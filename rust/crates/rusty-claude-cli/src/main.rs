@@ -276,6 +276,7 @@ enum LocalHelpTopic {
     Sandbox,
     Doctor,
     Lanes,
+    New,
     Task,
     TaskCreate,
     TaskValidate,
@@ -540,6 +541,7 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
                 "sandbox" => LocalHelpTopic::Sandbox,
                 "doctor" => LocalHelpTopic::Doctor,
                 "lanes" => LocalHelpTopic::Lanes,
+                "new" => LocalHelpTopic::New,
                 "task" => LocalHelpTopic::Task,
                 _ => return None,
             };
@@ -598,6 +600,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
             | "login"
             | "logout"
             | "init"
+            | "new"
             | "prompt"
     ) {
         return None;
@@ -5288,6 +5291,13 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Usage            claw lanes
   Purpose          show the current lanes surface
   Output           live lane list or JSON envelope with kind=lanes"
+            .to_string(),
+        LocalHelpTopic::New => "New
+  Usage            claw new <branch>
+  Purpose          create a lane worktree for <branch> with 30s timeout; if the branch already has an active lane, attach instead of creating
+  Flags            --output-format json returns { status: created|attached, branch, worktree_path|session_id }
+  Timeout          30 seconds per git operation; kills and errors on expiry
+  Stale branch     if branch exists but no active lane, removes stale worktree and recreates clean"
             .to_string(),
         LocalHelpTopic::Task => "Task
   Usage            claw task <create|validate> ...
