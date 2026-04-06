@@ -438,7 +438,7 @@ to:
 **Acceptance:** `claw /omc <args>` works outside REPL without "unknown slash command" error.
 
 ## #34 — Real token count in context-window preflight
-**Status:** Backlog
+**Status:** Done — `be561bf` (Claude-family uses real Anthropic count_tokens API; non-Anthropic keeps explicit heuristic label)
 **Pinpoint:** Preflight context-window check uses `serialized_json_bytes / 4 + 1` heuristic. The wording now says "estimate (heuristic)" (`c1883d0f`) but the count is still approximate. Operators hitting context limits get misleading numbers.
 **API path:** `POST /v1/messages/count_tokens` + `anthropic-beta: token-counting-2024-11-01` (Anthropic). xAI/OpenAI-compat: no equivalent — heuristic stays for those providers.
 **Tradeoffs:** Adds one network round-trip to preflight (~100–300ms). Fails offline. Consider: run exact count only when `--verbose` or when request is within 10% of limit; keep heuristic as fast path.
