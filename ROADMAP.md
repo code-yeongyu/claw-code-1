@@ -450,7 +450,7 @@ to:
 **Acceptance:** Anthropic context-window error shows exact token count; non-Anthropic shows explicit heuristic label.
 
 ## #35 — Session idle-without-progress not surfaced to operator
-**Status:** Backlog
+**Status:** Done (`3dccca0`)
 **Pinpoint:** A session can spin for 30+ minutes with 0 code changes and never signal that it is stuck. `claw lanes` shows `phase: running` based on last event timestamp, but has no concept of "running but not making progress." The context pressure warning (#29) fires on token pressure, not idle loops.
 **Observed:** 2026-04-06, `ses_29dc4e62` ran ROADMAP #31 for 30min, 0 additions, had to be killed manually.
 **Action:**
