@@ -268,7 +268,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
     assert!(summary["failures"].as_u64().is_some());
 
     let checks = doctor["checks"].as_array().expect("doctor checks");
-    assert_eq!(checks.len(), 5);
+    assert_eq!(checks.len(), 6);
     let check_names = checks
         .iter()
         .map(|check| {
@@ -280,7 +280,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         .collect::<Vec<_>>();
     assert_eq!(
         check_names,
-        vec!["auth", "config", "workspace", "sandbox", "system"]
+        vec!["auth", "config", "workspace", "sandbox", "lanes", "system"]
     );
 
     let workspace = checks

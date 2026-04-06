@@ -1210,6 +1210,7 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
             check_config_health(&config_loader, config.as_ref()),
             check_workspace_health(&context),
             check_sandbox_health(&context.sandbox_status),
+            check_lanes_health(),
             check_system_health(&cwd, config.as_ref().ok()),
         ],
     })
@@ -1611,6 +1612,45 @@ fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
         ),
         ("fallback_reason".to_string(), json!(status.fallback_reason)),
     ]))
+}
+
+fn check_lanes_health() -> DiagnosticCheck {
+    match load_live_lanes() {
+        Ok(lanes) if lanes.is_empty() => DiagnosticCheck::new(
+            "Lanes",
+            DiagnosticLevel::Ok,
+            "no active opencode sessions",
+        ),
+        Ok(lanes) => {
+            let stalled: Vec<_> = lanes.iter().filter(|l| l.phase == "stalled").collect();
+            let total = lanes.len();
+            let mut details = vec![format!("{total} active session(s)")];
+            for lane in &stalled {
+                details.push(format!(
+                    "  STALLED  {}  branch={}  last={}",
+                    lane.session_id,
+                    lane.branch,
+                    format_session_modified_age(u128::from(lane.last_event_ms)),
+                ));
+            }
+            let level = if stalled.is_empty() {
+                DiagnosticLevel::Ok
+            } else {
+                DiagnosticLevel::Warn
+            };
+            let summary = if stalled.is_empty() {
+                format!("{total} active session(s), none stalled")
+            } else {
+                format!("{} of {total} session(s) stalled", stalled.len())
+            };
+            DiagnosticCheck::new("Lanes", level, &summary).with_details(details)
+        }
+        Err(_) => DiagnosticCheck::new(
+            "Lanes",
+            DiagnosticLevel::Ok,
+            "could not read session data",
+        ),
+    }
 }
 
 fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
