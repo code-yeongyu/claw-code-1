@@ -4722,6 +4722,7 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
 struct LaneRecord {
     session_id: String,
     repo: String,
+    worktree_path: String,
     branch: String,
     phase: String,
     last_event_ms: u64,
@@ -4744,13 +4745,14 @@ fn render_lanes_report(lanes: &[LaneRecord]) -> String {
 
     for lane in lanes {
         lines.push(format!(
-            "  {session_id:<24} phase={phase:<7} branch={branch:<16} last={last:<10} blocker={blocker:<8} repo={repo}",
+            "  {session_id:<24} phase={phase:<13} branch={branch:<16} last={last:<10} blocker={blocker:<8} repo={repo} worktree={worktree}",
             session_id = lane.session_id,
             phase = lane.phase,
             branch = lane.branch,
             last = format_session_modified_age(u128::from(lane.last_event_ms)),
             blocker = lane.blocker.as_deref().unwrap_or("-"),
             repo = lane.repo,
+            worktree = lane.worktree_path,
         ));
     }
 
@@ -4777,14 +4779,27 @@ fn load_live_lanes() -> Result<Vec<LaneRecord>, Box<dyn std::error::Error>> {
 }
 
 fn opencode_data_dir() -> Option<PathBuf> {
-    env::var_os("XDG_DATA_HOME")
+    let xdg_candidate = env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .map(|path| path.join("opencode"))
-        .or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|path| path.join(".local").join("share").join("opencode"))
-        })
+        .map(|path| path.join("opencode"));
+    let local_candidate = env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|path| path.join(".local").join("share").join("opencode"));
+    let macos_candidate = env::var_os("HOME").map(PathBuf::from).map(|path| {
+        path.join("Library")
+            .join("Application Support")
+            .join("opencode")
+    });
+
+    xdg_candidate
+        .iter()
+        .chain(local_candidate.iter())
+        .chain(macos_candidate.iter())
+        .find(|path| path.exists())
+        .cloned()
+        .or(xdg_candidate)
+        .or(local_candidate)
+        .or(macos_candidate)
 }
 
 fn load_opencode_jsonl_lanes(
@@ -4904,17 +4919,28 @@ fn parse_opencode_jsonl_lane(
         .and_then(extract_repo_from_value)
         .or_else(|| last_message.as_ref().and_then(extract_repo_from_value))
         .unwrap_or_else(|| "unknown".to_string());
+    let worktree_path = session_meta
+        .as_ref()
+        .and_then(extract_worktree_path_from_value)
+        .or_else(|| last_message.as_ref().and_then(extract_worktree_path_from_value))
+        .unwrap_or_else(|| repo.clone());
     let last_event_ms = last_message
         .as_ref()
         .and_then(extract_timestamp_millis)
         .or_else(|| session_meta.as_ref().and_then(extract_timestamp_millis))
         .unwrap_or_default();
+    let title = session_meta
+        .as_ref()
+        .and_then(|value| value.get("title").and_then(Value::as_str));
+    let activity = last_message.as_ref().and_then(extract_lane_activity_hint);
+    let phase = classify_lane_phase(blocker.as_deref(), title, activity.as_deref());
 
     Ok(Some(LaneRecord {
         session_id,
-        branch: resolve_lane_branch(&repo),
-        phase: classify_lane_phase(last_event_ms),
+        branch: resolve_lane_branch(&worktree_path),
+        phase,
         repo,
+        worktree_path,
         last_event_ms,
         blocker,
     }))
@@ -4940,9 +4966,11 @@ fn parse_opencode_storage_lane(
         return Ok(None);
     };
 
-    let mut repo = extract_repo_from_value(&value);
+    let title = value.get("title").and_then(Value::as_str);
+    let mut worktree_path = extract_worktree_path_from_value(&value);
     let mut last_event_ms = extract_timestamp_millis(&value).unwrap_or_default();
     let mut blocker = None;
+    let mut activity = extract_lane_activity_hint(&value);
 
     for message_path in recent_opencode_message_paths(data_dir, &session_id, 20)? {
         let message_raw = fs::read_to_string(&message_path)?;
@@ -4950,18 +4978,21 @@ fn parse_opencode_storage_lane(
         let Ok(message_value) = serde_json::from_str::<Value>(&message_raw) else {
             continue;
         };
-        repo = repo.or_else(|| extract_repo_from_value(&message_value));
+        worktree_path = worktree_path.or_else(|| extract_worktree_path_from_value(&message_value));
+        activity = activity.or_else(|| extract_lane_activity_hint(&message_value));
         if let Some(timestamp) = extract_timestamp_millis(&message_value) {
             last_event_ms = last_event_ms.max(timestamp);
         }
     }
 
-    let repo = repo.unwrap_or_else(|| "unknown".to_string());
+    let worktree_path = worktree_path.unwrap_or_else(|| "unknown".to_string());
+    let repo = resolve_lane_repo(&worktree_path);
     Ok(Some(LaneRecord {
         session_id,
-        branch: resolve_lane_branch(&repo),
-        phase: classify_lane_phase(last_event_ms),
+        branch: resolve_lane_branch(&worktree_path),
+        phase: classify_lane_phase(blocker.as_deref(), title, activity.as_deref()),
         repo,
+        worktree_path,
         last_event_ms,
         blocker,
     }))
@@ -5072,6 +5103,10 @@ fn extract_repo_from_value(value: &Value) -> Option<String> {
     }
 }
 
+fn extract_worktree_path_from_value(value: &Value) -> Option<String> {
+    extract_repo_from_value(value)
+}
+
 fn extract_timestamp_millis(value: &Value) -> Option<u64> {
     match value {
         Value::Object(object) => {
@@ -5121,16 +5156,65 @@ fn resolve_lane_branch(repo: &str) -> String {
     resolve_git_branch_for(repo_path).unwrap_or_else(|| "unknown".to_string())
 }
 
-fn classify_lane_phase(last_event_ms: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map_or(0, |duration| duration.as_millis() as u64);
-    if now.saturating_sub(last_event_ms) < 5 * 60 * 1000 {
-        "running".to_string()
-    } else {
-        "idle".to_string()
+fn extract_lane_activity_hint(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(object) => {
+            for key in ["mode", "agent", "title"] {
+                if let Some(activity) = object.get(key).and_then(Value::as_str) {
+                    let activity = activity.trim();
+                    if !activity.is_empty() {
+                        return Some(activity.to_string());
+                    }
+                }
+            }
+
+            object.values().find_map(extract_lane_activity_hint)
+        }
+        Value::Array(values) => values.iter().find_map(extract_lane_activity_hint),
+        _ => None,
     }
+}
+
+fn classify_lane_phase(
+    blocker: Option<&str>,
+    title: Option<&str>,
+    activity: Option<&str>,
+) -> String {
+    if blocker.is_some() {
+        return "blocked".to_string();
+    }
+
+    let context = [activity, title]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if context.contains("review") || context.contains("oracle") || context.contains("verify") {
+        "verifying".to_string()
+    } else if context.contains("plan") {
+        "planning".to_string()
+    } else if context.contains("explore")
+        || context.contains("librarian")
+        || context.contains("fetch")
+        || context.contains("research")
+        || context.contains("investigat")
+    {
+        "exploring".to_string()
+    } else {
+        "implementing".to_string()
+    }
+}
+
+fn resolve_lane_repo(worktree_path: &str) -> String {
+    let worktree = Path::new(worktree_path);
+    if !worktree.exists() {
+        return worktree_path.to_string();
+    }
+
+    find_git_root_in(worktree)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| worktree_path.to_string())
 }
 
 fn render_help_topic(topic: LocalHelpTopic) -> String {
@@ -8611,8 +8695,9 @@ mod tests {
         let lanes = vec![LaneRecord {
             session_id: "ses_live".to_string(),
             repo: "/tmp/demo".to_string(),
+            worktree_path: "/tmp/demo-worktree".to_string(),
             branch: "unknown".to_string(),
-            phase: "running".to_string(),
+            phase: "implementing".to_string(),
             last_event_ms: 123,
             blocker: Some("blocked".to_string()),
         }];
@@ -8625,9 +8710,10 @@ mod tests {
         assert_eq!(json["kind"], "lanes");
         assert_eq!(json["lanes"][0]["session_id"], "ses_live");
         assert_eq!(json["lanes"][0]["repo"], "/tmp/demo");
+        assert_eq!(json["lanes"][0]["worktree_path"], "/tmp/demo-worktree");
         assert_eq!(json["lanes"][0]["blocker"], "blocked");
         assert!(message.contains("ses_live"));
-        assert!(message.contains("phase=running"));
+        assert!(message.contains("phase=implementing"));
     }
 
     #[test]
@@ -8645,8 +8731,8 @@ mod tests {
             sessions_dir.join("ses_jsonl_lane.jsonl"),
             format!(
                 concat!(
-                    "{{\"type\":\"session_meta\",\"session_id\":\"ses_jsonl_lane\",\"cwd\":\"/tmp/jsonl-repo\",\"updated_at_ms\":{now}}}\n",
-                    "{{\"type\":\"message\",\"timestamp_ms\":{now},\"message\":{{\"role\":\"assistant\",\"blocks\":[{{\"type\":\"text\",\"text\":\"blocked waiting on review\"}}]}}}}\n"
+                    "{{\"type\":\"session_meta\",\"session_id\":\"ses_jsonl_lane\",\"title\":\"Plan JSONL lane\",\"cwd\":\"/tmp/jsonl-repo\",\"updated_at_ms\":{now}}}\n",
+                    "{{\"type\":\"message\",\"timestamp_ms\":{now},\"mode\":\"plan\",\"message\":{{\"role\":\"assistant\",\"blocks\":[{{\"type\":\"text\",\"text\":\"prepare the final work plan\"}}]}}}}\n"
                 ),
                 now = now,
             ),
@@ -8662,10 +8748,11 @@ mod tests {
         assert_eq!(lanes.len(), 1);
         assert_eq!(lanes[0].session_id, "ses_jsonl_lane");
         assert_eq!(lanes[0].repo, "/tmp/jsonl-repo");
+        assert_eq!(lanes[0].worktree_path, "/tmp/jsonl-repo");
         assert_eq!(lanes[0].branch, "unknown");
-        assert_eq!(lanes[0].phase, "running");
+        assert_eq!(lanes[0].phase, "planning");
         assert_eq!(lanes[0].last_event_ms, now);
-        assert_eq!(lanes[0].blocker.as_deref(), Some("blocked"));
+        assert_eq!(lanes[0].blocker, None);
 
         match original_xdg {
             Some(value) => std::env::set_var("XDG_DATA_HOME", value),
@@ -8693,7 +8780,14 @@ mod tests {
         fs::write(
             sessions_dir.join("ses_storage_lane.json"),
             format!(
-                "{{\"id\":\"ses_storage_lane\",\"directory\":\"/tmp/storage-repo\",\"time\":{{\"updated\":{now}}}}}",
+                concat!(
+                    "{{",
+                    "\"id\":\"ses_storage_lane\",",
+                    "\"title\":\"Plan storage lane\",",
+                    "\"directory\":\"/tmp/storage-repo\",",
+                    "\"time\":{{\"updated\":{now}}}",
+                    "}}"
+                ),
                 now = now.saturating_sub(10_000),
             ),
         )
@@ -8723,14 +8817,92 @@ mod tests {
         assert_eq!(lanes.len(), 1);
         assert_eq!(lanes[0].session_id, "ses_storage_lane");
         assert_eq!(lanes[0].repo, "/tmp/storage-repo");
+        assert_eq!(lanes[0].worktree_path, "/tmp/storage-repo");
         assert_eq!(lanes[0].branch, "unknown");
-        assert_eq!(lanes[0].phase, "running");
+        assert_eq!(lanes[0].phase, "blocked");
         assert_eq!(lanes[0].last_event_ms, now);
         assert_eq!(lanes[0].blocker.as_deref(), Some("conflict"));
 
         match original_xdg {
             Some(value) => std::env::set_var("XDG_DATA_HOME", value),
             None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+    }
+
+    #[test]
+    fn load_live_lanes_reads_macos_application_support_layout() {
+        // given
+        let _guard = env_lock();
+        let home_dir = temp_dir().join("home-dir");
+        let opencode_dir = home_dir
+            .join("Library")
+            .join("Application Support")
+            .join("opencode");
+        let sessions_dir = opencode_dir.join("storage").join("session").join("global");
+        let messages_dir = opencode_dir
+            .join("storage")
+            .join("message")
+            .join("ses_macos_lane");
+        fs::create_dir_all(&sessions_dir).expect("macos sessions dir");
+        fs::create_dir_all(&messages_dir).expect("macos messages dir");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_millis() as u64;
+        fs::write(
+            sessions_dir.join("ses_macos_lane.json"),
+            format!(
+                concat!(
+                    "{{",
+                    "\"id\":\"ses_macos_lane\",",
+                    "\"title\":\"Deep code review lane\",",
+                    "\"directory\":\"/tmp/macos-repo\",",
+                    "\"time\":{{\"updated\":{now}}}",
+                    "}}"
+                ),
+                now = now.saturating_sub(5_000),
+            ),
+        )
+        .expect("macos session fixture");
+        fs::write(
+            messages_dir.join("msg_001.json"),
+            format!(
+                concat!(
+                    "{{",
+                    "\"id\":\"msg_001\",",
+                    "\"mode\":\"oracle\",",
+                    "\"agent\":\"oracle\",",
+                    "\"time\":{{\"completed\":{now}}},",
+                    "\"path\":{{\"cwd\":\"/tmp/macos-repo\"}}",
+                    "}}"
+                ),
+                now = now,
+            ),
+        )
+        .expect("macos message fixture");
+        let original_xdg = std::env::var_os("XDG_DATA_HOME");
+        let original_home = std::env::var_os("HOME");
+        std::env::remove_var("XDG_DATA_HOME");
+        std::env::set_var("HOME", &home_dir);
+
+        // when
+        let lanes = load_live_lanes().expect("lanes should load from macos app support");
+
+        // then
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].session_id, "ses_macos_lane");
+        assert_eq!(lanes[0].repo, "/tmp/macos-repo");
+        assert_eq!(lanes[0].worktree_path, "/tmp/macos-repo");
+        assert_eq!(lanes[0].phase, "verifying");
+        assert_eq!(lanes[0].last_event_ms, now);
+
+        match original_xdg {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
         }
     }
 
