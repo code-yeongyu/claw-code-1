@@ -166,6 +166,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
+        CliAction::Lanes { output_format } => run_lanes(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::Task { action } => run_task_command(action)?,
         CliAction::Repl {
@@ -241,6 +242,9 @@ enum CliAction {
     Doctor {
         output_format: CliOutputFormat,
     },
+    Lanes {
+        output_format: CliOutputFormat,
+    },
     Init {
         output_format: CliOutputFormat,
     },
@@ -264,6 +268,7 @@ enum LocalHelpTopic {
     Status,
     Sandbox,
     Doctor,
+    Lanes,
     Task,
     TaskCreate,
     TaskValidate,
@@ -474,6 +479,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
         "login" => Ok(CliAction::Login { output_format }),
         "logout" => Ok(CliAction::Logout { output_format }),
+        "lanes" => Ok(CliAction::Lanes { output_format }),
         "init" => Ok(CliAction::Init { output_format }),
         "prompt" => {
             let prompt = rest[1..].join(" ");
@@ -512,6 +518,7 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
                 "status" => LocalHelpTopic::Status,
                 "sandbox" => LocalHelpTopic::Sandbox,
                 "doctor" => LocalHelpTopic::Doctor,
+                "lanes" => LocalHelpTopic::Lanes,
                 "task" => LocalHelpTopic::Task,
                 _ => return None,
             };
@@ -553,6 +560,7 @@ fn parse_single_word_command_alias(
         })),
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
+        "lanes" => Some(Ok(CliAction::Lanes { output_format })),
         other => bare_slash_command_guidance(other).map(Err),
     }
 }
@@ -4710,6 +4718,17 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
     })
 }
 
+fn lanes_json_value() -> serde_json::Value {
+    json!({
+        "kind": "lanes",
+        "lanes": [],
+    })
+}
+
+fn render_lanes_report() -> &'static str {
+    "Lanes are not implemented yet."
+}
+
 fn render_help_topic(topic: LocalHelpTopic) -> String {
     match topic {
         LocalHelpTopic::Status => "Status
@@ -4729,6 +4748,11 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Purpose          diagnose local auth, config, workspace, sandbox, and build metadata
   Output           local-only health report; no provider request or session resume required
   Related          /doctor · claw --resume latest /doctor"
+            .to_string(),
+        LocalHelpTopic::Lanes => "Lanes
+  Usage            claw lanes
+  Purpose          show the current lanes surface
+  Output           placeholder text or JSON envelope with kind=lanes"
             .to_string(),
         LocalHelpTopic::Task => "Task
   Usage            claw task <create|validate> ...
@@ -4750,6 +4774,14 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
 
 fn print_help_topic(topic: LocalHelpTopic) {
     println!("{}", render_help_topic(topic));
+}
+
+fn run_lanes(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    match output_format {
+        CliOutputFormat::Text => println!("{}", render_lanes_report()),
+        CliOutputFormat::Json => println!("{}", serde_json::to_string_pretty(&lanes_json_value())?),
+    }
+    Ok(())
 }
 
 fn cli_task_registry() -> &'static TaskRegistry {
@@ -7189,6 +7221,8 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
+    writeln!(out, "  claw lanes")?;
+    writeln!(out, "      Show the current lanes surface")?;
     writeln!(out, "  claw dump-manifests")?;
     writeln!(out, "  claw bootstrap-plan")?;
     writeln!(out, "  claw agents")?;
@@ -7269,6 +7303,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw mcp show my-server")?;
     writeln!(out, "  claw /skills")?;
     writeln!(out, "  claw doctor")?;
+    writeln!(out, "  claw lanes")?;
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw init")?;
     Ok(())
@@ -7303,11 +7338,11 @@ mod tests {
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        normalize_permission_mode, parse_args, parse_git_status_branch,
+        lanes_json_value, normalize_permission_mode, parse_args, parse_git_status_branch,
         parse_git_status_metadata_for, parse_git_workspace_summary, permission_policy,
         print_help_to, push_output_block, render_config_report, render_diff_report,
-        render_diff_report_for, render_memory_report, render_repl_help, render_resume_usage,
-        resolve_model_alias, resolve_session_reference, response_to_events,
+        render_diff_report_for, render_lanes_report, render_memory_report, render_repl_help,
+        render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
         check_workspace_health, status_json_value,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
@@ -7954,6 +7989,12 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&["lanes".to_string()]).expect("lanes should parse"),
+            CliAction::Lanes {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
             parse_args(&["init".to_string()]).expect("init should parse"),
             CliAction::Init {
                 output_format: CliOutputFormat::Text,
@@ -8046,6 +8087,11 @@ mod tests {
             parse_args(&["doctor".to_string(), "--help".to_string()])
                 .expect("doctor help should parse"),
             CliAction::HelpTopic(LocalHelpTopic::Doctor)
+        );
+        assert_eq!(
+            parse_args(&["lanes".to_string(), "--help".to_string()])
+                .expect("lanes help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Lanes)
         );
         assert_eq!(
             parse_args(&["task".to_string(), "--help".to_string()])
@@ -8141,6 +8187,27 @@ mod tests {
                 },
             }
         );
+        assert_eq!(
+            parse_args(&["--output-format=json".to_string(), "lanes".to_string()])
+                .expect("json lanes should parse"),
+            CliAction::Lanes {
+                output_format: CliOutputFormat::Json,
+            }
+        );
+    }
+
+    #[test]
+    fn lanes_reports_use_the_expected_stub_shape() {
+        // given
+        let json = lanes_json_value();
+
+        // when
+        let message = render_lanes_report();
+
+        // then
+        assert_eq!(json["kind"], "lanes");
+        assert_eq!(json["lanes"], json!([]));
+        assert_eq!(message, "Lanes are not implemented yet.");
     }
 
     #[test]
@@ -8611,6 +8678,7 @@ mod tests {
         assert!(help.contains("claw agents"));
         assert!(help.contains("claw mcp"));
         assert!(help.contains("claw skills"));
+        assert!(help.contains("claw lanes"));
         assert!(help.contains("claw /skills"));
     }
 
