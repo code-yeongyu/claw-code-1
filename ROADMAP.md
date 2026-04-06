@@ -388,3 +388,12 @@ to:
   2. Includes integration suite
   3. Fails loud if integration tests are missing or skipped
 **Acceptance:** Running the canonical command from any directory produces identical results; missing integration suite causes non-zero exit.
+
+## #29 — Orchestrator session longevity gap
+**Status:** Backlog
+**Pinpoint:** Long-running orchestration sessions (e.g., multi-hour UltraClaw batch coordination) accumulate context until exec becomes unusable — outputs get compacted before they can be read, making local verification impossible. Subagent spawning becomes the only viable workaround.
+**Action:** Add orchestrator session affordances:
+  1. Context pressure warning at ~70% capacity: "context filling, consider compacting"
+  2. Auto-shedding of old tool outputs (keep last N per tool) before hitting the wall
+  3. `claw compact --session <id>` to compact a running session's history without restarting
+**Acceptance:** An orchestrator session running 4+ hours of parallel session coordination can still run `git log` and `cargo test` without output being compacted away.
