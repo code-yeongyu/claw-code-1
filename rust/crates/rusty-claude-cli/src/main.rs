@@ -5337,7 +5337,8 @@ fn run_new_lane(
     use std::time::Duration;
 
     let cwd = std::env::current_dir()?;
-    let worktree_path = cwd.join("..").join(format!("claw-worktree-{branch}"));
+    let safe_dir_name = branch.replace('/', "-");
+    let worktree_path = cwd.join("..").join(format!("claw-worktree-{safe_dir_name}"));
     let worktree_path = worktree_path.canonicalize().unwrap_or(worktree_path);
 
     // Pre-flight: check if branch already exists
