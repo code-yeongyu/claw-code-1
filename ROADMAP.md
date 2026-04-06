@@ -397,3 +397,12 @@ to:
   2. Auto-shedding of old tool outputs (keep last N per tool) before hitting the wall
   3. `claw compact --session <id>` to compact a running session's history without restarting
 **Acceptance:** An orchestrator session running 4+ hours of parallel session coordination can still run `git log` and `cargo test` without output being compacted away.
+
+## #30 — `claw lanes` real-time state (stub → live)
+**Status:** Backlog
+**Pinpoint:** `claw lanes` currently returns a hardcoded empty stub. During a real UltraClaw batch, there is no CLI surface to inspect which sessions are running, which are idle, which have a blocker, or what their last event was — forcing operators to either poll the Agentika topic or parse raw JSONL session files manually.
+**Action:** Wire `claw lanes --output-format json` to read live session state:
+  1. Enumerate active sessions from session JSONL files (or running opencode server API)
+  2. Return `{ kind: "lanes", lanes: [{ session_id, repo, worktree_path, branch, phase, last_event_ms, blocker }] }` per lane
+  3. Respond in <100ms without tmux/worktree scraping
+**Acceptance:** `claw lanes --output-format json` during a 4-session batch returns one entry per session with correct phase and a non-null `last_event_ms`.
