@@ -1634,7 +1634,13 @@ fn check_lanes_health() -> DiagnosticCheck {
             } else {
                 format!("{} of {total} session(s) stalled", stalled.len())
             };
-            DiagnosticCheck::new("Lanes", level, &summary).with_details(details)
+            DiagnosticCheck::new("Lanes", level, &summary)
+                .with_details(details)
+                .with_data(Map::from_iter([
+                    ("total_sessions".to_string(), json!(total)),
+                    ("stalled_sessions".to_string(), json!(stalled.len())),
+                    ("stalled_ids".to_string(), json!(stalled.iter().map(|l| &l.session_id).collect::<Vec<_>>())),
+                ]))
         }
         Err(_) => DiagnosticCheck::new(
             "Lanes",
