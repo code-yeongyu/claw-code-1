@@ -2691,7 +2691,9 @@ fn run_resume_command(
         | SlashCommand::Ide { .. }
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
-        | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
+        | SlashCommand::AddDir { .. } => {
+            Err(format!("{command:?} is not supported in resumed sessions").into())
+        }
     }
 }
 
