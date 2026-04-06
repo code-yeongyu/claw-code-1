@@ -5351,7 +5351,7 @@ fn run_new_lane(
                 match output_format {
                     CliOutputFormat::Json => println!(
                         "{}",
-                        serde_json::json!({"status": "attached", "branch": branch, "session_id": lane.session_id, "message": msg})
+                        serde_json::json!({"kind": "new_lane", "status": "attached", "branch": branch, "session_id": lane.session_id, "message": msg})
                     ),
                     _ => println!("{msg}"),
                 }
@@ -5412,7 +5412,7 @@ fn run_new_lane(
     match output_format {
         CliOutputFormat::Json => println!(
             "{}",
-            serde_json::json!({"status": "created", "branch": branch, "worktree_path": worktree_path.to_string_lossy()})
+            serde_json::json!({"kind": "new_lane", "status": "created", "branch": branch, "worktree_path": worktree_path.to_string_lossy()})
         ),
         _ => println!("{msg}"),
     }
