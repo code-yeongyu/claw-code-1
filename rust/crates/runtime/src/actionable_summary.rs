@@ -200,6 +200,7 @@ fn successful_checkpoint_label(event: &LaneEvent) -> Option<String> {
         LaneEventName::Merged => detail.or_else(|| Some("lane merged".to_string())),
         LaneEventName::Closed => detail.or_else(|| Some("lane closed".to_string())),
         LaneEventName::PromptMisdelivery
+        | LaneEventName::ContextPressure
         | LaneEventName::Blocked
         | LaneEventName::Red
         | LaneEventName::Failed

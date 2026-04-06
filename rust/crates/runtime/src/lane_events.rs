@@ -36,6 +36,8 @@ pub enum LaneEventName {
     Closed,
     #[serde(rename = "lane.recovery_attempted")]
     RecoveryAttempted,
+    #[serde(rename = "context_pressure")]
+    ContextPressure,
     #[serde(rename = "branch.stale_against_main")]
     BranchStaleAgainstMain,
 }
@@ -238,6 +240,25 @@ impl LaneEvent {
     }
 
     #[must_use]
+    pub fn context_pressure(
+        emitted_at: impl Into<String>,
+        utilization_pct: u8,
+        tokens_used: u32,
+        context_window: u32,
+    ) -> Self {
+        Self::new(
+            LaneEventName::ContextPressure,
+            LaneEventStatus::Running,
+            emitted_at,
+        )
+        .with_data(serde_json::json!({
+            "utilization_pct": utilization_pct,
+            "tokens_used": tokens_used,
+            "context_window": context_window,
+        }))
+    }
+
+    #[must_use]
     pub fn blocked(emitted_at: impl Into<String>, blocker: &LaneEventBlocker) -> Self {
         Self::new(LaneEventName::Blocked, LaneEventStatus::Blocked, emitted_at)
             .with_failure_class(blocker.failure_class)
@@ -393,6 +414,7 @@ mod tests {
             (LaneEventName::Superseded, "lane.superseded"),
             (LaneEventName::Closed, "lane.closed"),
             (LaneEventName::RecoveryAttempted, "lane.recovery_attempted"),
+            (LaneEventName::ContextPressure, "context_pressure"),
             (
                 LaneEventName::BranchStaleAgainstMain,
                 "branch.stale_against_main",
@@ -544,6 +566,11 @@ mod tests {
         let pr_payload = json!({
             "url": "https://github.com/example/repo/pull/42",
         });
+        let context_pressure_payload = json!({
+            "utilization_pct": 75,
+            "tokens_used": 150_000,
+            "context_window": 200_000,
+        });
         let stale_payload = json!({
             "branch": "feature/stale",
             "mainRef": "main",
@@ -566,8 +593,9 @@ mod tests {
             Some(pr_payload.clone()),
         );
         let merge_ready = LaneEvent::merge_ready("105", Some("ready to merge".to_string()));
+        let context_pressure = LaneEvent::context_pressure("106", 75, 150_000, 200_000);
         let stale = LaneEvent::branch_stale_against_main(
-            "106",
+            "107",
             "branch stale against main",
             stale_payload.clone(),
         );
@@ -588,6 +616,9 @@ mod tests {
         assert_eq!(pr_opened.data, Some(pr_payload));
         assert_eq!(merge_ready.event, LaneEventName::MergeReady);
         assert_eq!(merge_ready.status, LaneEventStatus::Green);
+        assert_eq!(context_pressure.event, LaneEventName::ContextPressure);
+        assert_eq!(context_pressure.status, LaneEventStatus::Running);
+        assert_eq!(context_pressure.data, Some(context_pressure_payload));
         assert_eq!(stale.event, LaneEventName::BranchStaleAgainstMain);
         assert_eq!(
             stale.failure_class,
@@ -632,10 +663,11 @@ mod tests {
                 Some(json!({ "url": "https://github.com/example/repo/pull/42" })),
             ),
             LaneEvent::merge_ready("108", Some("ready to merge".to_string())),
-            LaneEvent::finished("109", Some("lane finished cleanly".to_string())),
-            LaneEvent::failed("110", &blocker),
+            LaneEvent::context_pressure("109", 75, 150_000, 200_000),
+            LaneEvent::finished("110", Some("lane finished cleanly".to_string())),
+            LaneEvent::failed("111", &blocker),
             LaneEvent::branch_stale_against_main(
-                "111",
+                "112",
                 "branch stale against main",
                 json!({
                     "branch": "feature/events",

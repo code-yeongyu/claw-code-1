@@ -5,9 +5,10 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, resolve_model_alias, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    max_tokens_for_model, model_token_limit, resolve_model_alias, ContentBlockDelta,
+    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
+    ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -3961,6 +3962,10 @@ impl ApiClient for ProviderRuntimeClient {
             push_prompt_cache_record(&self.client, &mut events);
             Ok(events)
         })
+    }
+
+    fn context_window_tokens(&self) -> Option<u32> {
+        model_token_limit(&self.model).map(|limit| limit.context_window_tokens)
     }
 }
 

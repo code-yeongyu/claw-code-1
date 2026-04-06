@@ -24,7 +24,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient, AuthSource,
+    model_token_limit, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
+    AuthSource,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
     OutputContentBlock, PromptCache, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
     ToolResultContentBlock,
@@ -2246,6 +2247,27 @@ fn format_auto_compaction_notice(removed: usize) -> String {
     format!("[auto-compacted: removed {removed} messages]")
 }
 
+fn format_context_pressure_notice(utilization_pct: u8) -> String {
+    format!("WARN: context at {utilization_pct}% — consider claw compact before next turn")
+}
+
+fn context_pressure_notice(summary: &runtime::TurnSummary) -> Option<String> {
+    summary.lane_events.iter().find_map(|event| {
+        if event.event != runtime::LaneEventName::ContextPressure {
+            return None;
+        }
+
+        let utilization_pct = event
+            .data
+            .as_ref()?
+            .get("utilization_pct")?
+            .as_u64()?;
+        Some(format_context_pressure_notice(
+            utilization_pct.min(u64::from(u8::MAX)) as u8,
+        ))
+    })
+}
+
 fn parse_git_status_metadata(status: Option<&str>) -> (Option<PathBuf>, Option<String>) {
     parse_git_status_metadata_for(
         &env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -3299,6 +3321,9 @@ impl LiveCli {
                         format_auto_compaction_notice(event.removed_message_count)
                     );
                 }
+                if let Some(notice) = context_pressure_notice(&summary) {
+                    println!("{notice}");
+                }
                 self.persist_session()?;
                 Ok(())
             }
@@ -3346,6 +3371,8 @@ impl LiveCli {
                 "tool_uses": collect_tool_uses(&summary),
                 "tool_results": collect_tool_results(&summary),
                 "prompt_cache_events": collect_prompt_cache_events(&summary),
+                "lane_events": serde_json::to_value(&summary.lane_events)
+                    .expect("lane events should serialize"),
                 "usage": {
                     "input_tokens": summary.usage.input_tokens,
                     "output_tokens": summary.usage.output_tokens,
@@ -6706,6 +6733,10 @@ impl ApiClient for AnthropicRuntimeClient {
             Ok(events)
         })
     }
+
+    fn context_window_tokens(&self) -> Option<u32> {
+        model_token_limit(&self.model).map(|limit| limit.context_window_tokens)
+    }
 }
 
 fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
@@ -9322,6 +9353,15 @@ mod tests {
         assert!(compacted.contains("Messages removed 8"));
         let skipped = format_compact_report(0, 3, true);
         assert!(skipped.contains("Result           skipped"));
+    }
+
+    #[test]
+    fn context_pressure_notice_uses_expected_warning_text() {
+        let notice = super::format_context_pressure_notice(75);
+        assert_eq!(
+            notice,
+            "WARN: context at 75% — consider claw compact before next turn"
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::compact::{
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
-use crate::lane_events::FailureClass;
+use crate::lane_events::{FailureClass, LaneEvent};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
@@ -18,6 +18,7 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+const CONTEXT_PRESSURE_WARNING_THRESHOLD_PCT: u64 = 70;
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +54,10 @@ pub struct PromptCacheEvent {
 /// Minimal streaming API contract required by [`ConversationRuntime`].
 pub trait ApiClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
+
+    fn context_window_tokens(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Trait implemented by tool dispatchers that execute model-requested tools.
@@ -125,6 +130,7 @@ pub struct TurnSummary {
     pub assistant_messages: Vec<ConversationMessage>,
     pub tool_results: Vec<ConversationMessage>,
     pub prompt_cache_events: Vec<PromptCacheEvent>,
+    pub lane_events: Vec<LaneEvent>,
     pub iterations: usize,
     pub usage: TokenUsage,
     pub auto_compaction: Option<AutoCompactionEvent>,
@@ -321,6 +327,7 @@ where
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
+        let mut lane_events = Vec::new();
         let mut iterations = 0;
 
         loop {
@@ -376,6 +383,9 @@ where
                 .push_message(assistant_message.clone())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             assistant_messages.push(assistant_message);
+            if let Some(event) = self.maybe_context_pressure_event() {
+                lane_events.push(event);
+            }
 
             if pending_tool_uses.is_empty() {
                 break;
@@ -489,6 +499,7 @@ where
             assistant_messages,
             tool_results,
             prompt_cache_events,
+            lane_events,
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
@@ -551,6 +562,26 @@ where
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         })
+    }
+
+    fn maybe_context_pressure_event(&self) -> Option<LaneEvent> {
+        let context_window = self.api_client.context_window_tokens()?;
+        if context_window == 0 {
+            return None;
+        }
+
+        let estimated_tokens = self.estimated_tokens().min(u32::MAX as usize) as u32;
+        let utilization_pct = u64::from(estimated_tokens) * 100 / u64::from(context_window);
+        if utilization_pct <= CONTEXT_PRESSURE_WARNING_THRESHOLD_PCT {
+            return None;
+        }
+
+        Some(LaneEvent::context_pressure(
+            self.session.updated_at_ms.to_string(),
+            utilization_pct.min(u64::from(u8::MAX)) as u8,
+            estimated_tokens,
+            context_window,
+        ))
     }
 
     fn record_turn_started(&self, user_input: &str) {
@@ -810,7 +841,7 @@ mod tests {
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
-    use crate::lane_events::FailureClass;
+    use crate::lane_events::{FailureClass, LaneEventName, LaneEventStatus};
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
@@ -932,6 +963,7 @@ mod tests {
         assert_eq!(summary.assistant_messages.len(), 2);
         assert_eq!(summary.tool_results.len(), 1);
         assert_eq!(summary.prompt_cache_events.len(), 1);
+        assert!(summary.lane_events.is_empty());
         assert_eq!(runtime.session().messages.len(), 4);
         assert_eq!(summary.usage.output_tokens, 10);
         assert_eq!(summary.auto_compaction, None);
@@ -1638,6 +1670,80 @@ mod tests {
         assert_eq!(
             parse_auto_compaction_threshold(Some("not-a-number")),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn emits_context_pressure_event_when_session_exceeds_seventy_percent_of_capacity() {
+        struct ContextAwareApi;
+
+        impl ApiClient for ContextAwareApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+
+            fn context_window_tokens(&self) -> Option<u32> {
+                Some(1_000)
+            }
+        }
+
+        // given
+        let mut session = Session::new();
+        while ConversationRuntime::new(
+            session.clone(),
+            ContextAwareApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .estimated_tokens()
+            < 750
+        {
+            session
+                .push_user_text("x".repeat(128))
+                .expect("session should accept seeded context");
+        }
+        let mut runtime = ConversationRuntime::new(
+            session,
+            ContextAwareApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        // when
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+
+        // then
+        let event = summary
+            .lane_events
+            .iter()
+            .find(|event| event.event == LaneEventName::ContextPressure)
+            .expect("context pressure event should be emitted");
+        assert_eq!(event.status, LaneEventStatus::Running);
+        assert_eq!(
+            event.data.as_ref().expect("context pressure data")["context_window"],
+            1_000
+        );
+        assert!(
+            event.data.as_ref().expect("context pressure data")["utilization_pct"]
+                .as_u64()
+                .expect("utilization pct")
+                >= 75
         );
     }
 
