@@ -4318,6 +4318,9 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
 }
 
 fn format_session_modified_age(modified_epoch_millis: u128) -> String {
+    if modified_epoch_millis == 0 {
+        return "unknown".to_string();
+    }
     let now = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
