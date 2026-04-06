@@ -7959,6 +7959,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out, "  claw lanes")?;
     writeln!(out, "      Show the current lanes surface")?;
+    writeln!(out, "  claw new <branch>")?;
+    writeln!(
+        out,
+        "      Create a lane worktree (30s timeout, attaches if branch already active)"
+    )?;
     writeln!(out, "  claw dump-manifests")?;
     writeln!(out, "  claw bootstrap-plan")?;
     writeln!(out, "  claw agents")?;
