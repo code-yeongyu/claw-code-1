@@ -448,3 +448,14 @@ to:
   3. Surface exact count in error: `Input 352,102 tokens (exact)` vs `~352,332 tokens (heuristic)`
   4. For xAI/other providers, keep heuristic with explicit label
 **Acceptance:** Anthropic context-window error shows exact token count; non-Anthropic shows explicit heuristic label.
+
+## #35 — Session idle-without-progress not surfaced to operator
+**Status:** Backlog
+**Pinpoint:** A session can spin for 30+ minutes with 0 code changes and never signal that it is stuck. `claw lanes` shows `phase: running` based on last event timestamp, but has no concept of "running but not making progress." The context pressure warning (#29) fires on token pressure, not idle loops.
+**Observed:** 2026-04-06, `ses_29dc4e62` ran ROADMAP #31 for 30min, 0 additions, had to be killed manually.
+**Action:**
+  1. Add `idle_without_progress_ms` to lane state: time since last file change or tool-use event
+  2. If `idle_without_progress_ms > 10min`, surface `phase: stalled` in `claw lanes --output-format json`
+  3. Optionally emit a `LaneEvent::StallDetected { idle_ms }` into the session JSONL
+  4. CLI should print `WARN: session <id> has been idle for Xm — consider inspecting or restarting`
+**Acceptance:** After 10min idle with no file edits, `claw lanes` shows `phase: stalled` and CLI emits a warning.
