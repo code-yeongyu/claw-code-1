@@ -10,10 +10,10 @@ mod init;
 mod input;
 mod render;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -53,7 +53,7 @@ use runtime::{
     PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
     RuntimeError, Session, TaskPacket, TokenUsage, ToolError, ToolExecutor, UsageTracker, Worker,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tools::{
     load_agent_manifest_from_tool_output, GlobalToolRegistry, RuntimeToolDefinition,
@@ -4718,15 +4718,419 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
     })
 }
 
-fn lanes_json_value() -> serde_json::Value {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct LaneRecord {
+    session_id: String,
+    repo: String,
+    branch: String,
+    phase: String,
+    last_event_ms: u64,
+    blocker: Option<String>,
+}
+
+fn lanes_json_value(lanes: &[LaneRecord]) -> serde_json::Value {
     json!({
         "kind": "lanes",
-        "lanes": [],
+        "lanes": lanes,
     })
 }
 
-fn render_lanes_report() -> &'static str {
-    "Lanes are not implemented yet."
+fn render_lanes_report(lanes: &[LaneRecord]) -> String {
+    let mut lines = vec!["Lanes".to_string()];
+    if lanes.is_empty() {
+        lines.push("  No live opencode sessions found.".to_string());
+        return lines.join("\n");
+    }
+
+    for lane in lanes {
+        lines.push(format!(
+            "  {session_id:<24} phase={phase:<7} branch={branch:<16} last={last:<10} blocker={blocker:<8} repo={repo}",
+            session_id = lane.session_id,
+            phase = lane.phase,
+            branch = lane.branch,
+            last = format_session_modified_age(u128::from(lane.last_event_ms)),
+            blocker = lane.blocker.as_deref().unwrap_or("-"),
+            repo = lane.repo,
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn load_live_lanes() -> Result<Vec<LaneRecord>, Box<dyn std::error::Error>> {
+    let Some(data_dir) = opencode_data_dir() else {
+        return Ok(Vec::new());
+    };
+
+    let mut lanes = load_opencode_jsonl_lanes(&data_dir)?;
+    if lanes.is_empty() {
+        lanes = load_opencode_storage_lanes(&data_dir)?;
+    }
+
+    lanes.sort_by(|left, right| {
+        right
+            .last_event_ms
+            .cmp(&left.last_event_ms)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+    Ok(lanes)
+}
+
+fn opencode_data_dir() -> Option<PathBuf> {
+    env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .map(|path| path.join("opencode"))
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|path| path.join(".local").join("share").join("opencode"))
+        })
+}
+
+fn load_opencode_jsonl_lanes(
+    data_dir: &Path,
+) -> Result<Vec<LaneRecord>, Box<dyn std::error::Error>> {
+    let sessions_root = data_dir.join("session");
+    if !sessions_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut session_paths = Vec::new();
+    collect_files_with_extension(&sessions_root, PRIMARY_SESSION_EXTENSION, &mut session_paths)?;
+
+    let mut lanes = Vec::new();
+    for session_path in session_paths {
+        if let Some(lane) = parse_opencode_jsonl_lane(&session_path)? {
+            lanes.push(lane);
+        }
+    }
+    Ok(lanes)
+}
+
+fn load_opencode_storage_lanes(
+    data_dir: &Path,
+) -> Result<Vec<LaneRecord>, Box<dyn std::error::Error>> {
+    let sessions_root = data_dir.join("storage").join("session");
+    if !sessions_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut session_paths = Vec::new();
+    collect_files_with_extension(&sessions_root, LEGACY_SESSION_EXTENSION, &mut session_paths)?;
+
+    let mut lanes = Vec::new();
+    for session_path in session_paths {
+        if let Some(lane) = parse_opencode_storage_lane(data_dir, &session_path)? {
+            lanes.push(lane);
+        }
+    }
+    Ok(lanes)
+}
+
+fn collect_files_with_extension(
+    directory: &Path,
+    extension: &str,
+    files: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    if !directory.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_with_extension(&path, extension, files)?;
+            continue;
+        }
+
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+        {
+            files.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_opencode_jsonl_lane(
+    session_path: &Path,
+) -> Result<Option<LaneRecord>, Box<dyn std::error::Error>> {
+    let first_line = read_first_nonempty_line(session_path)?;
+    let tail_lines = read_tail_nonempty_lines(session_path, 20)?;
+    if first_line.is_none() && tail_lines.is_empty() {
+        return Ok(None);
+    }
+
+    let first_value = first_line
+        .as_deref()
+        .and_then(|line| serde_json::from_str::<Value>(line).ok());
+    let mut session_meta = first_value.filter(is_session_meta_record);
+    let mut last_message = None;
+    let mut blocker = None;
+
+    for line in &tail_lines {
+        blocker = blocker.or_else(|| detect_blocker(line));
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if session_meta.is_none() && is_session_meta_record(&value) {
+            session_meta = Some(value.clone());
+        }
+        if is_message_record(&value) {
+            last_message = Some(value);
+        }
+    }
+
+    let Some(session_id) = session_meta
+        .as_ref()
+        .and_then(|value| value.get("session_id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            session_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .map(ToOwned::to_owned)
+        })
+    else {
+        return Ok(None);
+    };
+
+    let repo = session_meta
+        .as_ref()
+        .and_then(extract_repo_from_value)
+        .or_else(|| last_message.as_ref().and_then(extract_repo_from_value))
+        .unwrap_or_else(|| "unknown".to_string());
+    let last_event_ms = last_message
+        .as_ref()
+        .and_then(extract_timestamp_millis)
+        .or_else(|| session_meta.as_ref().and_then(extract_timestamp_millis))
+        .unwrap_or_default();
+
+    Ok(Some(LaneRecord {
+        session_id,
+        branch: resolve_lane_branch(&repo),
+        phase: classify_lane_phase(last_event_ms),
+        repo,
+        last_event_ms,
+        blocker,
+    }))
+}
+
+fn parse_opencode_storage_lane(
+    data_dir: &Path,
+    session_path: &Path,
+) -> Result<Option<LaneRecord>, Box<dyn std::error::Error>> {
+    let raw = fs::read_to_string(session_path)?;
+    let value: Value = serde_json::from_str(&raw)?;
+    let Some(session_id) = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            session_path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned)
+        })
+    else {
+        return Ok(None);
+    };
+
+    let mut repo = extract_repo_from_value(&value);
+    let mut last_event_ms = extract_timestamp_millis(&value).unwrap_or_default();
+    let mut blocker = None;
+
+    for message_path in recent_opencode_message_paths(data_dir, &session_id, 20)? {
+        let message_raw = fs::read_to_string(&message_path)?;
+        blocker = blocker.or_else(|| detect_blocker(&message_raw));
+        let Ok(message_value) = serde_json::from_str::<Value>(&message_raw) else {
+            continue;
+        };
+        repo = repo.or_else(|| extract_repo_from_value(&message_value));
+        if let Some(timestamp) = extract_timestamp_millis(&message_value) {
+            last_event_ms = last_event_ms.max(timestamp);
+        }
+    }
+
+    let repo = repo.unwrap_or_else(|| "unknown".to_string());
+    Ok(Some(LaneRecord {
+        session_id,
+        branch: resolve_lane_branch(&repo),
+        phase: classify_lane_phase(last_event_ms),
+        repo,
+        last_event_ms,
+        blocker,
+    }))
+}
+
+fn recent_opencode_message_paths(
+    data_dir: &Path,
+    session_id: &str,
+    limit: usize,
+) -> io::Result<Vec<PathBuf>> {
+    let messages_dir = data_dir.join("storage").join("message").join(session_id);
+    if !messages_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut files = fs::read_dir(messages_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case(LEGACY_SESSION_EXTENSION))
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+
+    if files.len() > limit {
+        Ok(files.split_off(files.len() - limit))
+    } else {
+        Ok(files)
+    }
+}
+
+fn read_first_nonempty_line(path: &Path) -> io::Result<Option<String>> {
+    let file = fs::File::open(path)?;
+    let reader = io::BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn read_tail_nonempty_lines(path: &Path, limit: usize) -> io::Result<Vec<String>> {
+    let file = fs::File::open(path)?;
+    let reader = io::BufReader::new(file);
+    let mut lines = VecDeque::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if lines.len() == limit {
+            let _ = lines.pop_front();
+        }
+        lines.push_back(trimmed.to_string());
+    }
+
+    Ok(lines.into_iter().collect())
+}
+
+fn is_session_meta_record(value: &Value) -> bool {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|record_type| record_type == "session_meta")
+}
+
+fn is_message_record(value: &Value) -> bool {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|record_type| record_type == "message")
+}
+
+fn extract_repo_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(object) => {
+            for key in ["cwd", "directory", "repo"] {
+                if let Some(repo) = object.get(key).and_then(Value::as_str) {
+                    let repo = repo.trim();
+                    if !repo.is_empty() {
+                        return Some(repo.to_string());
+                    }
+                }
+            }
+
+            if let Some(path) = object.get("path").and_then(Value::as_object) {
+                for key in ["cwd", "root"] {
+                    if let Some(repo) = path.get(key).and_then(Value::as_str) {
+                        let repo = repo.trim();
+                        if !repo.is_empty() {
+                            return Some(repo.to_string());
+                        }
+                    }
+                }
+            }
+
+            object.values().find_map(extract_repo_from_value)
+        }
+        Value::Array(values) => values.iter().find_map(extract_repo_from_value),
+        _ => None,
+    }
+}
+
+fn extract_timestamp_millis(value: &Value) -> Option<u64> {
+    match value {
+        Value::Object(object) => {
+            for key in [
+                "last_event_ms",
+                "timestamp_ms",
+                "created_at_ms",
+                "updated_at_ms",
+                "completed_at_ms",
+            ] {
+                if let Some(timestamp) = object.get(key).and_then(Value::as_u64) {
+                    return Some(timestamp);
+                }
+            }
+
+            if let Some(time) = object.get("time").and_then(Value::as_object) {
+                for key in ["completed", "updated", "created"] {
+                    if let Some(timestamp) = time.get(key).and_then(Value::as_u64) {
+                        return Some(timestamp);
+                    }
+                }
+            }
+
+            object.values().find_map(extract_timestamp_millis)
+        }
+        Value::Array(values) => values.iter().find_map(extract_timestamp_millis),
+        _ => None,
+    }
+}
+
+fn detect_blocker(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("conflict") {
+        Some("conflict".to_string())
+    } else if lower.contains("blocked") {
+        Some("blocked".to_string())
+    } else {
+        None
+    }
+}
+
+fn resolve_lane_branch(repo: &str) -> String {
+    let repo_path = Path::new(repo);
+    if !repo_path.exists() {
+        return "unknown".to_string();
+    }
+    resolve_git_branch_for(repo_path).unwrap_or_else(|| "unknown".to_string())
+}
+
+fn classify_lane_phase(last_event_ms: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map_or(0, |duration| duration.as_millis() as u64);
+    if now.saturating_sub(last_event_ms) < 5 * 60 * 1000 {
+        "running".to_string()
+    } else {
+        "idle".to_string()
+    }
 }
 
 fn render_help_topic(topic: LocalHelpTopic) -> String {
@@ -4752,7 +5156,7 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
         LocalHelpTopic::Lanes => "Lanes
   Usage            claw lanes
   Purpose          show the current lanes surface
-  Output           placeholder text or JSON envelope with kind=lanes"
+  Output           live lane list or JSON envelope with kind=lanes"
             .to_string(),
         LocalHelpTopic::Task => "Task
   Usage            claw task <create|validate> ...
@@ -4777,9 +5181,13 @@ fn print_help_topic(topic: LocalHelpTopic) {
 }
 
 fn run_lanes(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let lanes = load_live_lanes()?;
     match output_format {
-        CliOutputFormat::Text => println!("{}", render_lanes_report()),
-        CliOutputFormat::Json => println!("{}", serde_json::to_string_pretty(&lanes_json_value())?),
+        CliOutputFormat::Text => println!("{}", render_lanes_report(&lanes)),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&lanes_json_value(&lanes))?
+        ),
     }
     Ok(())
 }
@@ -7338,13 +7746,14 @@ mod tests {
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        lanes_json_value, normalize_permission_mode, parse_args, parse_git_status_branch,
+        lanes_json_value, load_live_lanes, normalize_permission_mode, parse_args,
+        parse_git_status_branch,
         parse_git_status_metadata_for, parse_git_workspace_summary, permission_policy,
         print_help_to, push_output_block, render_config_report, render_diff_report,
         render_diff_report_for, render_lanes_report, render_memory_report, render_repl_help,
         render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
-        check_workspace_health, status_json_value,
+        check_workspace_health, status_json_value, LaneRecord,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         DiagnosticLevel, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
@@ -8197,17 +8606,132 @@ mod tests {
     }
 
     #[test]
-    fn lanes_reports_use_the_expected_stub_shape() {
+    fn lanes_reports_render_live_lane_payloads() {
         // given
-        let json = lanes_json_value();
+        let lanes = vec![LaneRecord {
+            session_id: "ses_live".to_string(),
+            repo: "/tmp/demo".to_string(),
+            branch: "unknown".to_string(),
+            phase: "running".to_string(),
+            last_event_ms: 123,
+            blocker: Some("blocked".to_string()),
+        }];
+        let json = lanes_json_value(&lanes);
 
         // when
-        let message = render_lanes_report();
+        let message = render_lanes_report(&lanes);
 
         // then
         assert_eq!(json["kind"], "lanes");
-        assert_eq!(json["lanes"], json!([]));
-        assert_eq!(message, "Lanes are not implemented yet.");
+        assert_eq!(json["lanes"][0]["session_id"], "ses_live");
+        assert_eq!(json["lanes"][0]["repo"], "/tmp/demo");
+        assert_eq!(json["lanes"][0]["blocker"], "blocked");
+        assert!(message.contains("ses_live"));
+        assert!(message.contains("phase=running"));
+    }
+
+    #[test]
+    fn load_live_lanes_reads_opencode_jsonl_sessions() {
+        // given
+        let _guard = env_lock();
+        let data_home = temp_dir().join("xdg-data");
+        let sessions_dir = data_home.join("opencode").join("session");
+        fs::create_dir_all(&sessions_dir).expect("jsonl sessions dir");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_millis() as u64;
+        fs::write(
+            sessions_dir.join("ses_jsonl_lane.jsonl"),
+            format!(
+                concat!(
+                    "{{\"type\":\"session_meta\",\"session_id\":\"ses_jsonl_lane\",\"cwd\":\"/tmp/jsonl-repo\",\"updated_at_ms\":{now}}}\n",
+                    "{{\"type\":\"message\",\"timestamp_ms\":{now},\"message\":{{\"role\":\"assistant\",\"blocks\":[{{\"type\":\"text\",\"text\":\"blocked waiting on review\"}}]}}}}\n"
+                ),
+                now = now,
+            ),
+        )
+        .expect("jsonl session fixture");
+        let original_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &data_home);
+
+        // when
+        let lanes = load_live_lanes().expect("lanes should load from jsonl");
+
+        // then
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].session_id, "ses_jsonl_lane");
+        assert_eq!(lanes[0].repo, "/tmp/jsonl-repo");
+        assert_eq!(lanes[0].branch, "unknown");
+        assert_eq!(lanes[0].phase, "running");
+        assert_eq!(lanes[0].last_event_ms, now);
+        assert_eq!(lanes[0].blocker.as_deref(), Some("blocked"));
+
+        match original_xdg {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+    }
+
+    #[test]
+    fn load_live_lanes_falls_back_to_opencode_storage_layout() {
+        // given
+        let _guard = env_lock();
+        let data_home = temp_dir().join("xdg-data");
+        let opencode_dir = data_home.join("opencode");
+        let sessions_dir = opencode_dir.join("storage").join("session").join("global");
+        let messages_dir = opencode_dir
+            .join("storage")
+            .join("message")
+            .join("ses_storage_lane");
+        fs::create_dir_all(&sessions_dir).expect("storage sessions dir");
+        fs::create_dir_all(&messages_dir).expect("storage messages dir");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_millis() as u64;
+        fs::write(
+            sessions_dir.join("ses_storage_lane.json"),
+            format!(
+                "{{\"id\":\"ses_storage_lane\",\"directory\":\"/tmp/storage-repo\",\"time\":{{\"updated\":{now}}}}}",
+                now = now.saturating_sub(10_000),
+            ),
+        )
+        .expect("storage session fixture");
+        fs::write(
+            messages_dir.join("msg_002.json"),
+            format!(
+                concat!(
+                    "{{",
+                    "\"id\":\"msg_002\",",
+                    "\"time\":{{\"created\":{now},\"completed\":{now}}},",
+                    "\"path\":{{\"cwd\":\"/tmp/storage-repo\"}},",
+                    "\"content\":\"merge conflict on upstream branch\"",
+                    "}}"
+                ),
+                now = now,
+            ),
+        )
+        .expect("storage message fixture");
+        let original_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &data_home);
+
+        // when
+        let lanes = load_live_lanes().expect("lanes should load from storage fallback");
+
+        // then
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].session_id, "ses_storage_lane");
+        assert_eq!(lanes[0].repo, "/tmp/storage-repo");
+        assert_eq!(lanes[0].branch, "unknown");
+        assert_eq!(lanes[0].phase, "running");
+        assert_eq!(lanes[0].last_event_ms, now);
+        assert_eq!(lanes[0].blocker.as_deref(), Some("conflict"));
+
+        match original_xdg {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
     }
 
     #[test]
