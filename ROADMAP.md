@@ -469,3 +469,13 @@ to:
   2. OR: Add a `claw relay --to <agent-id>` that sends the local bundle to a privileged agent via Agentika topic for auto-push
   3. The receiving agent validates (build + test) then pushes
 **Acceptance:** A read-only agent can run `claw push-request` and have commits reach upstream within 5 minutes without human intervention.
+
+## #37 — CLI-REPL command surface parity has no compile-time enforcement
+**Status:** Backlog
+**Pinpoint:** CLI parse (`parse_args` match arm) and REPL dispatch (`try_parse_repl_subcommand` match arm) are two independent match blocks with no shared command registry. Adding a new subcommand requires manual edits to both, plus the help topic table, plus the `bare_slash_command_guidance` exclusion list, plus the main `print_help_to` listing — 5 separate sites, zero compile-time link between them. `claw new` proved this: it was wired into 3 of 5 sites on first commit, needed 3 follow-up commits to close the gaps.
+**Observed:** 2026-04-06, `claw new` was missing from REPL dispatch (`50afdf9`), main help listing (`01ddc26`), and had no parity test.
+**Action:**
+  1. Extract a shared `SubcommandSpec` enum or registry that both CLI parse and REPL dispatch read from
+  2. Add a compile-time or test-time assertion: every `SubcommandSpec` variant must appear in parse, REPL dispatch, help listing, and bare-command guidance
+  3. Alternatively: a single `#[test]` that iterates known subcommands and asserts each one parses successfully in both `parse_args` and `try_parse_repl_subcommand`
+**Acceptance:** Adding a new subcommand that compiles but is missing from REPL dispatch causes a test failure.
