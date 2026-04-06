@@ -426,3 +426,13 @@ to:
   2. Flag branches with `commits_ahead > 0 && !merged_into_main` as "live unmerged" in both text and JSON output
   3. Optionally surface this in `claw lanes` so each lane entry includes `branch_status`
 **Acceptance:** `claw branches --status --output-format json` completes in <500ms and correctly identifies which branches carry unmerged code vs which are purely historical.
+
+## #33 — `/omc` slash command not registered outside REPL
+**Status:** Backlog
+**Pinpoint:** `claw /omc` exits with `unknown slash command outside the REPL: /omc`. The OMC interop path exists in the provider/tools layer but the CLI dispatch table has no `/omc` entry for non-REPL invocation.
+**Observed:** 2026-04-06, direct dogfooding by gaebal-gajae.
+**Action:**
+  1. Find where slash commands are registered for CLI (non-REPL) mode in `main.rs`
+  2. Add `/omc` entry that routes to the OMC interop handler
+  3. Add test: `claw /omc --help` exits 0 and prints usage
+**Acceptance:** `claw /omc <args>` works outside REPL without "unknown slash command" error.
