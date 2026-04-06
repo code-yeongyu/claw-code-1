@@ -170,6 +170,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Lanes { output_format } => run_lanes(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
+        CliAction::New { branch, output_format } => run_new_lane(&branch, output_format)?,
         CliAction::Task { action } => run_task_command(action)?,
         CliAction::Repl {
             model,
@@ -248,6 +249,10 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Init {
+        output_format: CliOutputFormat,
+    },
+    New {
+        branch: String,
         output_format: CliOutputFormat,
     },
     Task {
@@ -490,6 +495,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "logout" => Ok(CliAction::Logout { output_format }),
         "lanes" => Ok(CliAction::Lanes { output_format }),
         "init" => Ok(CliAction::Init { output_format }),
+        "new" => {
+            let branch = rest.get(1).cloned().unwrap_or_default();
+            if branch.trim().is_empty() {
+                return Err("new subcommand requires a branch name".to_string());
+            }
+            Ok(CliAction::New { branch, output_format })
+        }
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -5297,6 +5309,104 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
 
 fn print_help_topic(topic: LocalHelpTopic) {
     println!("{}", render_help_topic(topic));
+}
+
+fn run_new_lane(
+    branch: &str,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+    use std::time::Duration;
+
+    let cwd = std::env::current_dir()?;
+    let worktree_path = cwd.join("..").join(format!("claw-worktree-{branch}"));
+    let worktree_path = worktree_path.canonicalize().unwrap_or(worktree_path);
+
+    // Pre-flight: check if branch already exists
+    let branch_exists = Command::new("git")
+        .args(["rev-parse", "--verify", branch])
+        .current_dir(&cwd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if branch_exists {
+        // Check if an active lane already uses this branch
+        if let Ok(lanes) = load_live_lanes() {
+            if let Some(lane) = lanes.iter().find(|l| l.branch == branch) {
+                let msg = format!(
+                    "Lane for branch '{}' already active (session {}). Attaching instead of creating new.",
+                    branch, lane.session_id
+                );
+                match output_format {
+                    CliOutputFormat::Json => println!(
+                        "{}",
+                        serde_json::json!({"status": "attached", "branch": branch, "session_id": lane.session_id, "message": msg})
+                    ),
+                    _ => println!("{msg}"),
+                }
+                return Ok(());
+            }
+        }
+        // Branch exists but no active lane — clean up stale worktree if present
+        if worktree_path.exists() {
+            eprintln!("Removing stale worktree at {}", worktree_path.display());
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--force", &worktree_path.to_string_lossy()])
+                .current_dir(&cwd)
+                .output();
+        }
+    }
+
+    // Create worktree with 30s timeout
+    eprintln!("Creating worktree for branch '{branch}' at {}", worktree_path.display());
+    let worktree_str = worktree_path.to_string_lossy().into_owned();
+    let worktree_args: Vec<&str> = if branch_exists {
+        vec!["worktree", "add", &worktree_str, branch]
+    } else {
+        vec!["worktree", "add", "-b", branch, &worktree_str]
+    };
+
+    // Spawn with timeout
+    let mut child = Command::new("git")
+        .args(&worktree_args)
+        .current_dir(&cwd)
+        .spawn()
+        .map_err(|e| format!("Failed to spawn git worktree: {e}"))?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return Err(format!("git worktree add failed with status: {status}").into());
+                }
+                break;
+            }
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    return Err("git worktree add timed out after 30s".into());
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => return Err(format!("git worktree wait error: {e}").into()),
+        }
+    }
+
+    let msg = format!(
+        "Lane '{}' created at {}",
+        branch,
+        worktree_path.display()
+    );
+    match output_format {
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({"status": "created", "branch": branch, "worktree_path": worktree_path.to_string_lossy()})
+        ),
+        _ => println!("{msg}"),
+    }
+    Ok(())
 }
 
 fn run_lanes(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
