@@ -7,6 +7,7 @@ use api::{read_xai_base_url, ApiError, AuthSource, ProviderClient, ProviderKind}
 fn provider_client_routes_grok_aliases_through_xai() {
     let _lock = env_lock();
     let _xai_api_key = EnvVarGuard::set("XAI_API_KEY", Some("xai-test-key"));
+    let _openai_base_url = EnvVarGuard::set("OPENAI_BASE_URL", None);
 
     let client = ProviderClient::from_model("grok-mini").expect("grok alias should resolve");
 
@@ -15,6 +16,9 @@ fn provider_client_routes_grok_aliases_through_xai() {
 
 #[test]
 fn provider_client_routes_explicit_bedrock_models_through_bedrock() {
+    let _lock = env_lock();
+    let _openai_base_url = EnvVarGuard::set("OPENAI_BASE_URL", None);
+
     let client = ProviderClient::from_model("us.anthropic.claude-sonnet-4-6")
         .expect("explicit Bedrock model ids should resolve");
 
@@ -25,6 +29,7 @@ fn provider_client_routes_explicit_bedrock_models_through_bedrock() {
 fn provider_client_reports_missing_xai_credentials_for_grok_models() {
     let _lock = env_lock();
     let _xai_api_key = EnvVarGuard::set("XAI_API_KEY", None);
+    let _openai_base_url = EnvVarGuard::set("OPENAI_BASE_URL", None);
 
     let error = ProviderClient::from_model("grok-3")
         .expect_err("grok requests without XAI_API_KEY should fail fast");
@@ -43,6 +48,7 @@ fn provider_client_uses_explicit_anthropic_auth_without_env_lookup() {
     let _lock = env_lock();
     let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
     let _anthropic_auth_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+    let _openai_base_url = EnvVarGuard::set("OPENAI_BASE_URL", None);
 
     let client = ProviderClient::from_model_with_anthropic_auth(
         "claude-sonnet-4-6",

@@ -183,6 +183,58 @@ async fn given_openai_compat_base_url_without_api_key_when_send_message_then_req
     assert_eq!(body["tool_choice"], json!("auto"));
 }
 
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn given_openai_base_url_when_known_claude_model_uses_tools_then_request_uses_openai_function_format(
+) {
+    let _lock = env_lock();
+    let _openai_api_key = ScopedEnvVar::set_optional("OPENAI_API_KEY", None);
+    let _anthropic_api_key = ScopedEnvVar::set_optional("ANTHROPIC_API_KEY", None);
+    let _anthropic_auth_token = ScopedEnvVar::set_optional("ANTHROPIC_AUTH_TOKEN", None);
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_claude_override\",",
+        "\"model\":\"claude-sonnet-4-6\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"Override works\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+    let _openai_base_url =
+        ScopedEnvVar::set_optional("OPENAI_BASE_URL", Some(server.base_url().as_str()));
+
+    let client = ProviderClient::from_model("claude-sonnet-4-6")
+        .expect("OPENAI_BASE_URL should force known Claude models through OpenAI compat");
+    assert!(matches!(client, ProviderClient::OpenAi(_)));
+
+    let response = client
+        .send_message(&MessageRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("request should succeed against OpenAI-compatible override");
+
+    assert_eq!(response.total_tokens(), 14);
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    assert_eq!(request.path, "/chat/completions");
+    assert!(!request.headers.contains_key("x-api-key"));
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("claude-sonnet-4-6"));
+    assert_eq!(body["tools"][0]["type"], json!("function"));
+    assert_eq!(body["tool_choice"], json!("auto"));
+}
+
 #[tokio::test]
 async fn stream_message_normalizes_text_and_multiple_tool_calls() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
@@ -362,6 +414,7 @@ async fn openai_streaming_requests_opt_into_usage_chunks() {
 async fn provider_client_dispatches_xai_requests_from_env() {
     let _lock = env_lock();
     let _api_key = ScopedEnvVar::set("XAI_API_KEY", "xai-test-key");
+    let _openai_base_url = ScopedEnvVar::set_optional("OPENAI_BASE_URL", None);
 
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let server = spawn_server(

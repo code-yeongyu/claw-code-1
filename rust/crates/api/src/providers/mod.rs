@@ -185,11 +185,11 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
 
 #[must_use]
 pub fn detect_provider_kind(model: &str) -> ProviderKind {
-    if let Some(metadata) = metadata_for_model(model) {
-        return metadata.provider;
-    }
     if openai_compat::has_base_url_override(openai_compat::OpenAiCompatConfig::openai()) {
         return ProviderKind::OpenAi;
+    }
+    if let Some(metadata) = metadata_for_model(model) {
+        return metadata.provider;
     }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
         return ProviderKind::Anthropic;
@@ -278,6 +278,9 @@ fn estimate_serialized_tokens<T: Serialize>(value: &T) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
     use serde_json::json;
 
     use crate::error::ApiError;
@@ -299,6 +302,9 @@ mod tests {
 
     #[test]
     fn detects_provider_from_model_name_first() {
+        let _lock = env_lock();
+        let _openai_base_url = EnvVarGuard::set("OPENAI_BASE_URL", None);
+
         assert_eq!(detect_provider_kind("grok"), ProviderKind::Xai);
         assert_eq!(
             detect_provider_kind("claude-sonnet-4-6"),
@@ -308,6 +314,38 @@ mod tests {
             detect_provider_kind("us.anthropic.claude-sonnet-4-6"),
             ProviderKind::Bedrock
         );
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var_os(key);
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 
     #[test]
