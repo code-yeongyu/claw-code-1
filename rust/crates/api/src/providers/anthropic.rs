@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, SessionTracer};
 
-use crate::error::ApiError;
+use crate::error::{parse_json_response, ApiError};
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
 use super::{
@@ -301,10 +301,8 @@ impl AnthropicClient {
 
         let response = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(response.headers());
-        let mut response = response
-            .json::<MessageResponse>()
-            .await
-            .map_err(ApiError::from)?;
+        let mut response: MessageResponse =
+            parse_json_response(response, "Anthropic", Some(&request.model)).await?;
         if response.request_id.is_none() {
             response.request_id = request_id;
         }
@@ -349,7 +347,7 @@ impl AnthropicClient {
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
-            parser: SseParser::new(),
+            parser: SseParser::for_model(request.model.clone()),
             pending: VecDeque::new(),
             done: false,
             request: request.clone(),
@@ -374,10 +372,7 @@ impl AnthropicClient {
             .await
             .map_err(ApiError::from)?;
         let response = expect_success(response).await?;
-        response
-            .json::<OAuthTokenSet>()
-            .await
-            .map_err(ApiError::from)
+        parse_json_response(response, "Anthropic", Some("oauth")).await
     }
 
     pub async fn refresh_oauth_token(
@@ -394,10 +389,7 @@ impl AnthropicClient {
             .await
             .map_err(ApiError::from)?;
         let response = expect_success(response).await?;
-        response
-            .json::<OAuthTokenSet>()
-            .await
-            .map_err(ApiError::from)
+        parse_json_response(response, "Anthropic", Some("oauth")).await
     }
 
     async fn send_with_retry(

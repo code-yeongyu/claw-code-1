@@ -4,7 +4,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::error::ApiError;
+use crate::error::{parse_json_response, parse_json_str, ApiError};
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
@@ -136,7 +136,8 @@ impl OpenAiCompatClient {
         preflight_message_request(&request)?;
         let response = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(response.headers());
-        let payload = response.json::<ChatCompletionResponse>().await?;
+        let payload =
+            parse_json_response(response, self.config.provider_name, Some(&request.model)).await?;
         let mut normalized = normalize_response(&request.model, payload)?;
         if normalized.request_id.is_none() {
             normalized.request_id = request_id;
@@ -155,7 +156,7 @@ impl OpenAiCompatClient {
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
-            parser: OpenAiSseParser::new(),
+            parser: OpenAiSseParser::new(self.config.provider_name, request.model.clone()),
             pending: VecDeque::new(),
             done: false,
             state: StreamState::new(request.model.clone()),
@@ -285,14 +286,20 @@ impl MessageStream {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct OpenAiSseParser {
     buffer: Vec<u8>,
+    provider: &'static str,
+    model: String,
 }
 
 impl OpenAiSseParser {
-    fn new() -> Self {
-        Self::default()
+    fn new(provider: &'static str, model: String) -> Self {
+        Self {
+            buffer: Vec::new(),
+            provider,
+            model,
+        }
     }
 
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<ChatCompletionChunk>, ApiError> {
@@ -300,7 +307,7 @@ impl OpenAiSseParser {
         let mut events = Vec::new();
 
         while let Some(frame) = next_sse_frame(&mut self.buffer) {
-            if let Some(event) = parse_sse_frame(&frame)? {
+            if let Some(event) = parse_sse_frame(&frame, self.provider, &self.model)? {
                 events.push(event);
             }
         }
@@ -841,7 +848,11 @@ fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
     Some(String::from_utf8_lossy(&frame[..frame_len]).into_owned())
 }
 
-fn parse_sse_frame(frame: &str) -> Result<Option<ChatCompletionChunk>, ApiError> {
+fn parse_sse_frame(
+    frame: &str,
+    provider: &'static str,
+    model: &str,
+) -> Result<Option<ChatCompletionChunk>, ApiError> {
     let trimmed = frame.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -863,9 +874,7 @@ fn parse_sse_frame(frame: &str) -> Result<Option<ChatCompletionChunk>, ApiError>
     if payload == "[DONE]" {
         return Ok(None);
     }
-    serde_json::from_str(&payload)
-        .map(Some)
-        .map_err(ApiError::from)
+    parse_json_str(&payload, provider, Some(model)).map(Some)
 }
 
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {

@@ -1,9 +1,10 @@
-use crate::error::ApiError;
+use crate::error::{parse_json_str, ApiError};
 use crate::types::StreamEvent;
 
 #[derive(Debug, Default)]
 pub struct SseParser {
     buffer: Vec<u8>,
+    model: Option<String>,
 }
 
 impl SseParser {
@@ -12,12 +13,20 @@ impl SseParser {
         Self::default()
     }
 
+    #[must_use]
+    pub fn for_model(model: impl Into<String>) -> Self {
+        Self {
+            buffer: Vec::new(),
+            model: Some(model.into()),
+        }
+    }
+
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<StreamEvent>, ApiError> {
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
 
         while let Some(frame) = self.next_frame() {
-            if let Some(event) = parse_frame(&frame)? {
+            if let Some(event) = parse_frame_with_context(&frame, self.model.as_deref())? {
                 events.push(event);
             }
         }
@@ -31,7 +40,8 @@ impl SseParser {
         }
 
         let trailing = std::mem::take(&mut self.buffer);
-        match parse_frame(&String::from_utf8_lossy(&trailing))? {
+        match parse_frame_with_context(&String::from_utf8_lossy(&trailing), self.model.as_deref())?
+        {
             Some(event) => Ok(vec![event]),
             None => Ok(Vec::new()),
         }
@@ -61,6 +71,13 @@ impl SseParser {
 }
 
 pub fn parse_frame(frame: &str) -> Result<Option<StreamEvent>, ApiError> {
+    parse_frame_with_context(frame, Some("<unknown>"))
+}
+
+fn parse_frame_with_context(
+    frame: &str,
+    model: Option<&str>,
+) -> Result<Option<StreamEvent>, ApiError> {
     let trimmed = frame.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -95,14 +112,12 @@ pub fn parse_frame(frame: &str) -> Result<Option<StreamEvent>, ApiError> {
         return Ok(None);
     }
 
-    serde_json::from_str::<StreamEvent>(&payload)
-        .map(Some)
-        .map_err(ApiError::from)
+    parse_json_str::<StreamEvent>(&payload, "Anthropic", model).map(Some)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_frame, SseParser};
+    use super::{parse_frame, parse_frame_with_context, SseParser};
     use crate::types::{ContentBlockDelta, MessageDelta, OutputContentBlock, StreamEvent, Usage};
 
     #[test]
@@ -275,5 +290,29 @@ mod tests {
                 }
             ))
         );
+    }
+
+    #[test]
+    fn enriches_json_parse_errors_with_provider_model_and_truncated_body() {
+        // given
+        let frame = format!(
+            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"unexpected\":\"{}\"}}\n\n",
+            "x".repeat(250)
+        );
+
+        // when
+        let error = parse_frame_with_context(&frame, Some("claude-sonnet-4-6"))
+            .expect_err("invalid frame should surface a json parse error");
+        let rendered = error.to_string();
+        let snippet = rendered
+            .split("; raw response body: ")
+            .nth(1)
+            .expect("error should include raw response body");
+
+        // then
+        assert!(rendered.contains("json error for provider Anthropic model claude-sonnet-4-6"));
+        assert!(rendered.contains("missing field"));
+        assert!(snippet.chars().count() <= 200);
+        assert!(snippet.ends_with('…'));
     }
 }

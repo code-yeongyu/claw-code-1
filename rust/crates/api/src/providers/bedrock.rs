@@ -13,7 +13,7 @@ use aws_sigv4::{
 use aws_smithy_runtime_api::client::identity::Identity;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ApiError;
+use crate::error::{parse_json_response, ApiError};
 use crate::types::{
     InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest, MessageResponse,
     MessageStartEvent, MessageStopEvent, StreamEvent, ToolChoice, ToolDefinition,
@@ -109,7 +109,8 @@ impl BedrockClient {
         preflight_message_request(&request)?;
         let response = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(response.headers());
-        let mut payload = response.json::<MessageResponse>().await?;
+        let mut payload: MessageResponse =
+            parse_json_response(response, "Bedrock", Some(&request.model)).await?;
         if payload.request_id.is_none() {
             payload.request_id = request_id;
         }

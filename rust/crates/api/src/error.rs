@@ -3,6 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
 use runtime::FailureClass;
+use serde::de::DeserializeOwned;
 
 const GENERIC_FATAL_WRAPPER_MARKERS: &[&str] = &[
     "something went wrong while processing your request",
@@ -18,6 +19,8 @@ const CONTEXT_WINDOW_ERROR_MARKERS: &[&str] = &[
     "input is too long",
     "request is too large",
 ];
+
+const JSON_ERROR_BODY_LIMIT: usize = 200;
 
 #[derive(Debug)]
 pub enum ApiError {
@@ -37,7 +40,12 @@ pub enum ApiError {
     InvalidApiKeyEnv(VarError),
     Http(reqwest::Error),
     Io(std::io::Error),
-    Json(serde_json::Error),
+    Json {
+        source: serde_json::Error,
+        provider: Option<&'static str>,
+        model: Option<String>,
+        raw_body: Option<String>,
+    },
     Api {
         status: reqwest::StatusCode,
         error_type: Option<String>,
@@ -78,7 +86,7 @@ impl ApiError {
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
             | Self::Io(_)
-            | Self::Json(_)
+            | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. } => false,
         }
@@ -96,7 +104,7 @@ impl ApiError {
             | Self::InvalidApiKeyEnv(_)
             | Self::Http(_)
             | Self::Io(_)
-            | Self::Json(_)
+            | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. } => None,
         }
@@ -122,7 +130,7 @@ impl ApiError {
             Self::Http(_) | Self::InvalidSseFrame(_) | Self::BackoffOverflow { .. } => {
                 "provider_transport"
             }
-            Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json(_) => "runtime_io",
+            Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
         }
     }
 
@@ -143,7 +151,7 @@ impl ApiError {
             | Self::BackoffOverflow { .. }
             | Self::InvalidApiKeyEnv(_)
             | Self::Io(_)
-            | Self::Json(_) => FailureClass::Infra,
+            | Self::Json { .. } => FailureClass::Infra,
         }
     }
 
@@ -164,7 +172,7 @@ impl ApiError {
             | Self::InvalidApiKeyEnv(_)
             | Self::Http(_)
             | Self::Io(_)
-            | Self::Json(_)
+            | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. } => false,
         }
@@ -193,9 +201,24 @@ impl ApiError {
             | Self::InvalidApiKeyEnv(_)
             | Self::Http(_)
             | Self::Io(_)
-            | Self::Json(_)
+            | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. } => false,
+        }
+    }
+
+    #[must_use]
+    pub fn json_with_context(
+        source: serde_json::Error,
+        provider: &'static str,
+        model: Option<String>,
+        raw_body: &str,
+    ) -> Self {
+        Self::Json {
+            source,
+            provider: Some(provider),
+            model,
+            raw_body: Some(truncate_json_error_body(raw_body)),
         }
     }
 }
@@ -230,7 +253,25 @@ impl Display for ApiError {
             }
             Self::Http(error) => write!(f, "http error: {error}"),
             Self::Io(error) => write!(f, "io error: {error}"),
-            Self::Json(error) => write!(f, "json error: {error}"),
+            Self::Json {
+                source,
+                provider,
+                model,
+                raw_body,
+            } => {
+                write!(f, "json error")?;
+                if let Some(provider) = provider {
+                    write!(f, " for provider {provider}")?;
+                }
+                if let Some(model) = model {
+                    write!(f, " model {model}")?;
+                }
+                write!(f, ": {source}")?;
+                if let Some(raw_body) = raw_body {
+                    write!(f, "; raw response body: {raw_body}")?;
+                }
+                Ok(())
+            }
             Self::Api {
                 status,
                 error_type,
@@ -285,7 +326,12 @@ impl From<std::io::Error> for ApiError {
 
 impl From<serde_json::Error> for ApiError {
     fn from(value: serde_json::Error) -> Self {
-        Self::Json(value)
+        Self::Json {
+            source: value,
+            provider: None,
+            model: None,
+            raw_body: None,
+        }
     }
 }
 
@@ -307,6 +353,46 @@ fn looks_like_context_window_error(text: &str) -> bool {
     CONTEXT_WINDOW_ERROR_MARKERS
         .iter()
         .any(|marker| lowered.contains(marker))
+}
+
+pub(crate) fn parse_json_str<T: DeserializeOwned>(
+    raw_body: &str,
+    provider: &'static str,
+    model: Option<&str>,
+) -> Result<T, ApiError> {
+    serde_json::from_str(raw_body).map_err(|source| {
+        ApiError::json_with_context(source, provider, model.map(ToOwned::to_owned), raw_body)
+    })
+}
+
+pub(crate) async fn parse_json_response<T: DeserializeOwned>(
+    response: reqwest::Response,
+    provider: &'static str,
+    model: Option<&str>,
+) -> Result<T, ApiError> {
+    let raw_body = response.text().await.map_err(ApiError::from)?;
+    parse_json_str(&raw_body, provider, model)
+}
+
+fn truncate_json_error_body(raw_body: &str) -> String {
+    let normalized = raw_body
+        .chars()
+        .map(|ch| match ch {
+            '\r' | '\n' | '\t' => ' ',
+            _ => ch,
+        })
+        .collect::<String>();
+    let char_count = normalized.chars().count();
+    if char_count <= JSON_ERROR_BODY_LIMIT {
+        return normalized;
+    }
+
+    let mut truncated = normalized
+        .chars()
+        .take(JSON_ERROR_BODY_LIMIT.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 #[cfg(test)]
