@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use api::{
@@ -338,6 +339,14 @@ impl GlobalToolRegistry {
     }
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
+        if name == "batch" {
+            let input = from_value::<BatchInput>(input)?;
+            return to_pretty_json(execute_batch_with_registry(self.clone(), input)?);
+        }
+        self.execute_single(name, input)
+    }
+
+    fn execute_single(&self, name: &str, input: &Value) -> Result<String, String> {
         if mvp_tool_specs().iter().any(|spec| spec.name == name) {
             return execute_tool_with_enforcer(self.enforcer.as_ref(), name, input);
         }
@@ -385,6 +394,31 @@ fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
 #[allow(clippy::too_many_lines)]
 pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
+        ToolSpec {
+            name: "batch",
+            description:
+                "Execute multiple tool calls in parallel and aggregate per-call results. Inspired by opencode batch tool.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "calls": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tool": { "type": "string" },
+                                "input": { "type": "object" }
+                            },
+                            "required": ["tool", "input"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["calls"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
         ToolSpec {
             name: "bash",
             description: "Execute a shell command in the current workspace.",
@@ -1181,29 +1215,47 @@ fn execute_tool_with_enforcer(
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
+    execute_tool_with_context(enforcer.cloned(), None, name, input)
+}
+
+fn execute_tool_with_context(
+    enforcer: Option<PermissionEnforcer>,
+    allowed_tools: Option<BTreeSet<String>>,
+    name: &str,
+    input: &Value,
+) -> Result<String, String> {
+    if let Some(allowed_tools) = allowed_tools.as_ref() {
+        if !allowed_tools.contains(name) {
+            return Err(format!("tool `{name}` is not enabled for this sub-agent"));
+        }
+    }
+
     match name {
+        "batch" => from_value::<BatchInput>(input).and_then(|input| {
+            to_pretty_json(execute_batch_with_context(enforcer, allowed_tools, input)?)
+        }),
         "bash" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer.as_ref(), name, input)?;
             from_value::<BashCommandInput>(input).and_then(run_bash)
         }
         "read_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer.as_ref(), name, input)?;
             from_value::<ReadFileInput>(input).and_then(run_read_file)
         }
         "write_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer.as_ref(), name, input)?;
             from_value::<WriteFileInput>(input).and_then(run_write_file)
         }
         "edit_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer.as_ref(), name, input)?;
             from_value::<EditFileInput>(input).and_then(run_edit_file)
         }
         "glob_search" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer.as_ref(), name, input)?;
             from_value::<GlobSearchInputValue>(input).and_then(run_glob_search)
         }
         "grep_search" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer.as_ref(), name, input)?;
             from_value::<GrepSearchInput>(input).and_then(run_grep_search)
         }
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
@@ -2003,6 +2055,97 @@ fn run_powershell(input: PowerShellInput) -> Result<String, String> {
     to_pretty_json(execute_powershell(input).map_err(|error| error.to_string())?)
 }
 
+fn execute_batch_with_context(
+    enforcer: Option<PermissionEnforcer>,
+    allowed_tools: Option<BTreeSet<String>>,
+    input: BatchInput,
+) -> Result<BatchOutput, String> {
+    let executor = Arc::new(move |tool: String, input: Value| {
+        execute_tool_with_context(enforcer.clone(), allowed_tools.clone(), &tool, &input)
+    });
+    execute_batch(input, executor)
+}
+
+fn execute_batch_with_registry(
+    registry: GlobalToolRegistry,
+    input: BatchInput,
+) -> Result<BatchOutput, String> {
+    let executor = Arc::new(move |tool: String, input: Value| registry.execute_single(&tool, &input));
+    execute_batch(input, executor)
+}
+
+fn execute_batch(
+    input: BatchInput,
+    executor: Arc<dyn Fn(String, Value) -> Result<String, String> + Send + Sync>,
+) -> Result<BatchOutput, String> {
+    let worker_threads = input.calls.len().clamp(1, 32);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .build()
+        .map_err(|error| error.to_string())?;
+
+    runtime.block_on(async move {
+        let handles = input
+            .calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, call)| {
+                let executor = Arc::clone(&executor);
+                let tool = call.tool.clone();
+                let tool_for_result = tool.clone();
+                let handle = tokio::spawn(async move {
+                    if tool == "batch" {
+                        Err(String::from("nested batch calls are not supported"))
+                    } else {
+                        executor(tool, call.input)
+                    }
+                });
+                (index, tool_for_result, handle)
+            })
+            .collect::<Vec<_>>();
+
+        let mut results = Vec::with_capacity(handles.len());
+        for (index, tool, handle) in handles {
+            match handle.await {
+                Ok(Ok(output)) => results.push(BatchCallResult {
+                    index,
+                    tool,
+                    ok: true,
+                    output: Some(parse_batch_output_value(output)),
+                    error: None,
+                }),
+                Ok(Err(error)) => results.push(BatchCallResult {
+                    index,
+                    tool,
+                    ok: false,
+                    output: None,
+                    error: Some(error),
+                }),
+                Err(error) => results.push(BatchCallResult {
+                    index,
+                    tool,
+                    ok: false,
+                    output: None,
+                    error: Some(format!("batch task join error: {error}")),
+                }),
+            }
+        }
+
+        let succeeded_calls = results.iter().filter(|result| result.ok).count();
+        let failed_calls = results.len().saturating_sub(succeeded_calls);
+        Ok(BatchOutput {
+            total_calls: results.len(),
+            succeeded_calls,
+            failed_calls,
+            results,
+        })
+    })
+}
+
+fn parse_batch_output_value(output: String) -> Value {
+    serde_json::from_str(&output).unwrap_or(Value::String(output))
+}
+
 fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
     serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
 }
@@ -2017,6 +2160,17 @@ struct ReadFileInput {
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct BatchInput {
+    calls: Vec<BatchCallInput>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct BatchCallInput {
+    tool: String,
+    input: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2318,6 +2472,25 @@ struct WebFetchOutput {
     #[serde(rename = "durationMs")]
     duration_ms: u128,
     url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchOutput {
+    total_calls: usize,
+    succeeded_calls: usize,
+    failed_calls: usize,
+    results: Vec<BatchCallResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchCallResult {
+    index: usize,
+    tool: String,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3992,15 +4165,15 @@ impl SubagentToolExecutor {
 
 impl ToolExecutor for SubagentToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
-        if !self.allowed_tools.contains(tool_name) {
-            return Err(ToolError::new(format!(
-                "tool `{tool_name}` is not enabled for this sub-agent"
-            )));
-        }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
-            .map_err(ToolError::new)
+        execute_tool_with_context(
+            self.enforcer.clone(),
+            Some(self.allowed_tools.clone()),
+            tool_name,
+            &value,
+        )
+        .map_err(ToolError::new)
     }
 }
 
@@ -5462,6 +5635,7 @@ mod tests {
             .into_iter()
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
+        assert!(names.contains(&"batch"));
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"WebFetch"));
@@ -7606,6 +7780,87 @@ mod tests {
     }
 
     #[test]
+    fn given_multiple_sleep_calls_when_batch_executes_then_results_are_parallel_and_ordered() {
+        // given
+        let started = std::time::Instant::now();
+
+        // when
+        let result = execute_tool(
+            "batch",
+            &json!({
+                "calls": [
+                    { "tool": "Sleep", "input": { "duration_ms": 150 } },
+                    { "tool": "Sleep", "input": { "duration_ms": 150 } },
+                    { "tool": "Sleep", "input": { "duration_ms": 150 } }
+                ]
+            }),
+        )
+        .expect("batch should succeed");
+        let elapsed = started.elapsed();
+
+        // then
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        let results = output["results"].as_array().expect("results array");
+        assert_eq!(output["total_calls"], 3);
+        assert_eq!(output["succeeded_calls"], 3);
+        assert_eq!(output["failed_calls"], 0);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0]["index"], 0);
+        assert_eq!(results[1]["index"], 1);
+        assert_eq!(results[2]["index"], 2);
+        assert_eq!(results[0]["tool"], "Sleep");
+        assert_eq!(results[1]["tool"], "Sleep");
+        assert_eq!(results[2]["tool"], "Sleep");
+        assert_eq!(results[0]["ok"], true);
+        assert_eq!(results[1]["ok"], true);
+        assert_eq!(results[2]["ok"], true);
+        assert_eq!(results[0]["output"]["duration_ms"], 150);
+        assert_eq!(results[1]["output"]["duration_ms"], 150);
+        assert_eq!(results[2]["output"]["duration_ms"], 150);
+        assert!(
+            elapsed < Duration::from_millis(320),
+            "batch should execute in parallel, elapsed was {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn given_partial_failures_when_batch_executes_then_successes_and_errors_are_both_returned() {
+        // given
+
+        // when
+        let result = execute_tool(
+            "batch",
+            &json!({
+                "calls": [
+                    { "tool": "Sleep", "input": { "duration_ms": 0 } },
+                    { "tool": "Sleep", "input": { "duration_ms": 999_999_999_u64 } },
+                    { "tool": "nope", "input": {} }
+                ]
+            }),
+        )
+        .expect("batch should aggregate call failures");
+
+        // then
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        let results = output["results"].as_array().expect("results array");
+        assert_eq!(output["total_calls"], 3);
+        assert_eq!(output["succeeded_calls"], 1);
+        assert_eq!(output["failed_calls"], 2);
+        assert_eq!(results[0]["ok"], true);
+        assert_eq!(results[0]["output"]["duration_ms"], 0);
+        assert_eq!(results[1]["ok"], false);
+        assert!(results[1]["error"]
+            .as_str()
+            .expect("error")
+            .contains("exceeds maximum allowed sleep"));
+        assert_eq!(results[2]["ok"], false);
+        assert!(results[2]["error"]
+            .as_str()
+            .expect("error")
+            .contains("unsupported tool"));
+    }
+
+    #[test]
     fn brief_returns_sent_message_and_attachment_metadata() {
         let attachment = std::env::temp_dir().join(format!(
             "clawd-brief-{}.png",
@@ -8055,6 +8310,43 @@ printf 'pwsh:%s' "$1"
             result.is_ok(),
             "glob_search should be allowed in read-only mode: {result:?}"
         );
+    }
+
+    #[test]
+    fn given_read_only_enforcer_when_batch_contains_bash_then_only_inner_bash_call_is_denied() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("perm-batch-read");
+        fs::create_dir_all(&root).expect("create root");
+        let file = root.join("readable.txt");
+        fs::write(&file, "content\n").expect("write test file");
+
+        let registry = read_only_registry();
+        let result = registry
+            .execute(
+                "batch",
+                &json!({
+                    "calls": [
+                        { "tool": "read_file", "input": { "path": file.display().to_string() } },
+                        { "tool": "bash", "input": { "command": "printf 'nope'" } }
+                    ]
+                }),
+            )
+            .expect("batch should aggregate permission failures");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        let results = output["results"].as_array().expect("results array");
+        assert_eq!(output["succeeded_calls"], 1);
+        assert_eq!(output["failed_calls"], 1);
+        assert_eq!(results[0]["ok"], true);
+        assert_eq!(results[1]["ok"], false);
+        assert!(results[1]["error"]
+            .as_str()
+            .expect("error")
+            .contains("current mode is read-only"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
