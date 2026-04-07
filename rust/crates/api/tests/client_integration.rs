@@ -90,7 +90,7 @@ async fn send_message_posts_json_and_parses_response() {
     );
     assert_eq!(
         request.headers.get("anthropic-beta").map(String::as_str),
-        Some("claude-code-20250219,prompt-caching-scope-2026-01-05")
+        None
     );
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be json");
@@ -186,7 +186,7 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
     let request = captured.first().expect("server should capture request");
     assert_eq!(
         request.headers.get("anthropic-beta").map(String::as_str),
-        Some("claude-code-20250219,prompt-caching-scope-2026-01-05,tools-2026-04-01")
+        None
     );
     assert_eq!(
         request.headers.get("user-agent").map(String::as_str),
@@ -238,6 +238,56 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
         &events[5],
         TelemetryEvent::SessionTrace(trace) if trace.name == "analytics"
     ));
+}
+
+#[tokio::test]
+async fn send_message_omits_beta_fields_for_non_anthropic_base_urls() {
+    // given
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response(
+            "200 OK",
+            "application/json",
+            concat!(
+                "{",
+                "\"id\":\"msg_non_anthropic\",",
+                "\"type\":\"message\",",
+                "\"role\":\"assistant\",",
+                "\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],",
+                "\"model\":\"claude-3-7-sonnet-latest\",",
+                "\"stop_reason\":\"end_turn\",",
+                "\"stop_sequence\":null,",
+                "\"usage\":{\"input_tokens\":1,\"output_tokens\":1}",
+                "}"
+            ),
+        )],
+    )
+    .await;
+    let client = AnthropicClient::new("test-key")
+        .with_base_url(server.base_url())
+        .with_beta("tools-2026-04-01")
+        .with_extra_body_param("metadata", json!({"source": "test"}));
+
+    // when
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("request should succeed");
+
+    // then
+    assert_eq!(response.total_tokens(), 2);
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("server should capture request");
+    assert_eq!(
+        request.headers.get("anthropic-beta").map(String::as_str),
+        None
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be json");
+    assert_eq!(body["metadata"]["source"], json!("test"));
+    assert!(body.get("betas").is_none());
 }
 
 #[tokio::test]

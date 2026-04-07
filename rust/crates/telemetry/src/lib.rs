@@ -91,6 +91,11 @@ impl AnthropicRequestProfile {
 
     #[must_use]
     pub fn header_pairs(&self) -> Vec<(String, String)> {
+        self.header_pairs_with_betas(true)
+    }
+
+    #[must_use]
+    pub fn header_pairs_with_betas(&self, include_betas: bool) -> Vec<(String, String)> {
         let mut headers = vec![
             (
                 "anthropic-version".to_string(),
@@ -98,7 +103,7 @@ impl AnthropicRequestProfile {
             ),
             ("user-agent".to_string(), self.client_identity.user_agent()),
         ];
-        if !self.betas.is_empty() {
+        if include_betas && !self.betas.is_empty() {
             headers.push(("anthropic-beta".to_string(), self.betas.join(",")));
         }
         headers
@@ -501,13 +506,11 @@ mod tests {
         // then
         assert_eq!(
             profile
-                .header_pairs()
+                .header_pairs_with_betas(false)
                 .into_iter()
                 .find(|(key, _)| key == "anthropic-beta")
                 .map(|(_, value)| value),
-            Some(
-                "claude-code-20250219,prompt-caching-scope-2026-01-05,tools-2026-04-01".to_string()
-            )
+            None
         );
         assert_eq!(
             body["metadata"]["source"],

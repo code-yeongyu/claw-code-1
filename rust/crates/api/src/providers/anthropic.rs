@@ -469,20 +469,24 @@ impl AnthropicClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let include_betas = should_include_betas(&request_url);
         let request_body = self
             .request_profile
-            .render_json_body_with_betas(request, should_include_betas_in_body(&request_url))?;
-        let request_builder = self.build_request(&request_url).json(&request_body);
+            .render_json_body_with_betas(request, include_betas)?;
+        let request_builder = self
+            .build_request(&request_url, include_betas)
+            .json(&request_body);
         request_builder.send().await.map_err(ApiError::from)
     }
 
-    fn build_request(&self, request_url: &str) -> reqwest::RequestBuilder {
+    fn build_request(&self, request_url: &str, include_betas: bool) -> reqwest::RequestBuilder {
         let request_builder = self
             .http
             .post(request_url)
             .header("content-type", "application/json");
         let mut request_builder = self.auth.apply(request_builder);
-        for (header_name, header_value) in self.request_profile.header_pairs() {
+        for (header_name, header_value) in self.request_profile.header_pairs_with_betas(include_betas)
+        {
             request_builder = request_builder.header(header_name, header_value);
         }
         request_builder
@@ -744,7 +748,7 @@ fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Strin
         .map(ToOwned::to_owned)
 }
 
-fn should_include_betas_in_body(request_url: &str) -> bool {
+fn should_include_betas(request_url: &str) -> bool {
     reqwest::Url::parse(request_url)
         .ok()
         .and_then(|url| url.host_str().map(is_anthropic_host))
@@ -898,7 +902,7 @@ mod tests {
 
     use super::{
         is_anthropic_host, now_unix_timestamp, oauth_token_is_expired, resolve_saved_oauth_token,
-        resolve_startup_auth_source, should_include_betas_in_body, AnthropicClient, AuthSource,
+        resolve_startup_auth_source, should_include_betas, AnthropicClient, AuthSource,
         OAuthTokenSet,
     };
     use crate::types::{ContentBlockDelta, MessageRequest};
@@ -1366,14 +1370,14 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_hosts_are_detected_for_body_betas() {
+    fn anthropic_hosts_are_detected_for_beta_fields() {
         // given
         let anthropic_host = "api.anthropic.com";
         let request_url = "https://api.anthropic.com/v1/messages";
 
         // when
         let host_is_anthropic = is_anthropic_host(anthropic_host);
-        let request_keeps_betas = should_include_betas_in_body(request_url);
+        let request_keeps_betas = should_include_betas(request_url);
 
         // then
         assert!(host_is_anthropic);
@@ -1381,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    fn non_anthropic_hosts_skip_body_betas() {
+    fn non_anthropic_hosts_skip_beta_fields() {
         // given
         let request_urls = [
             "https://openrouter.ai/api/v1/messages",
@@ -1393,7 +1397,7 @@ mod tests {
         // when
         let includes_body_betas = request_urls
             .iter()
-            .any(|request_url| should_include_betas_in_body(request_url));
+            .any(|request_url| should_include_betas(request_url));
 
         // then
         assert!(!includes_body_betas);
