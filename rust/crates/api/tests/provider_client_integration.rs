@@ -14,6 +14,14 @@ fn provider_client_routes_grok_aliases_through_xai() {
 }
 
 #[test]
+fn provider_client_routes_explicit_bedrock_models_through_bedrock() {
+    let client = ProviderClient::from_model("us.anthropic.claude-sonnet-4-6")
+        .expect("explicit Bedrock model ids should resolve");
+
+    assert_eq!(client.provider_kind(), ProviderKind::Bedrock);
+}
+
+#[test]
 fn provider_client_reports_missing_xai_credentials_for_grok_models() {
     let _lock = env_lock();
     let _xai_api_key = EnvVarGuard::set("XAI_API_KEY", None);

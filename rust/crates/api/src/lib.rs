@@ -16,6 +16,7 @@ pub use prompt_cache::{
 };
 pub use providers::anthropic::oauth_unsupported_for_openai_base_url_message;
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
+pub use providers::bedrock::BedrockClient;
 pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig};
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, model_token_limit, resolve_model_alias,

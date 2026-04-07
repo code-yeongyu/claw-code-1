@@ -26,8 +26,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     model_token_limit, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
     AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, PromptCache, StreamEvent as ApiStreamEvent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient, ProviderKind,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -346,11 +346,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --model".to_string())?;
-                model = resolve_model_alias(value).to_string();
+                model = resolve_model_alias(value);
                 index += 2;
             }
             flag if flag.starts_with("--model=") => {
-                model = resolve_model_alias(&flag[8..]).to_string();
+                model = resolve_model_alias(&flag[8..]);
                 index += 1;
             }
             "--output-format" => {
@@ -387,7 +387,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }
                 return Ok(CliAction::Prompt {
                     prompt,
-                    model: resolve_model_alias(&model).to_string(),
+                    model: resolve_model_alias(&model),
                     output_format,
                     allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
                     permission_mode: permission_mode_override
@@ -838,13 +838,8 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
     previous[right_chars.len()]
 }
 
-fn resolve_model_alias(model: &str) -> &str {
-    match model {
-        "opus" => "claude-opus-4-6",
-        "sonnet" => "claude-sonnet-4-6",
-        "haiku" => "claude-haiku-4-5-20251213",
-        _ => model,
-    }
+fn resolve_model_alias(model: &str) -> String {
+    api::resolve_model_alias(model)
 }
 
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
@@ -2794,7 +2789,7 @@ struct RuntimeMcpState {
 }
 
 struct BuiltRuntime {
-    runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
+    runtime: Option<ConversationRuntime<ApiRuntimeClient, CliToolExecutor>>,
     plugin_registry: PluginRegistry,
     plugins_active: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
@@ -2803,7 +2798,7 @@ struct BuiltRuntime {
 
 impl BuiltRuntime {
     fn new(
-        runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+        runtime: ConversationRuntime<ApiRuntimeClient, CliToolExecutor>,
         plugin_registry: PluginRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
@@ -2848,7 +2843,7 @@ impl BuiltRuntime {
 }
 
 impl Deref for BuiltRuntime {
-    type Target = ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>;
+    type Target = ConversationRuntime<ApiRuntimeClient, CliToolExecutor>;
 
     fn deref(&self) -> &Self::Target {
         self.runtime
@@ -6701,7 +6696,7 @@ fn build_runtime_with_plugin_state(
         .map_err(std::io::Error::other)?;
     let mut runtime = ConversationRuntime::new_with_features(
         session,
-        AnthropicRuntimeClient::new(
+        ApiRuntimeClient::new(
             session_id,
             model,
             enable_tools,
@@ -6808,9 +6803,9 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
-struct AnthropicRuntimeClient {
+struct ApiRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ProviderClient,
     session_id: String,
     model: String,
     enable_tools: bool,
@@ -6820,7 +6815,7 @@ struct AnthropicRuntimeClient {
     progress_reporter: Option<InternalPromptProgressReporter>,
 }
 
-impl AnthropicRuntimeClient {
+impl ApiRuntimeClient {
     fn new(
         session_id: &str,
         model: String,
@@ -6830,11 +6825,10 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client: build_cli_provider_client_for_cwd(&cwd, session_id, &model)?,
             session_id: session_id.to_string(),
             model,
             enable_tools,
@@ -6844,6 +6838,24 @@ impl AnthropicRuntimeClient {
             progress_reporter,
         })
     }
+}
+
+fn build_cli_provider_client_for_cwd(
+    cwd: &Path,
+    session_id: &str,
+    model: &str,
+) -> Result<ProviderClient, api::ApiError> {
+    let resolved_model = api::resolve_model_alias(model);
+    let client = match api::detect_provider_kind(&resolved_model) {
+        ProviderKind::Anthropic => ProviderClient::from_model_with_anthropic_auth(
+            &resolved_model,
+            Some(resolve_cli_auth_source_for_cwd(cwd, default_oauth_config)?),
+        )?,
+        ProviderKind::Bedrock | ProviderKind::Xai | ProviderKind::OpenAi => {
+            ProviderClient::from_model(&resolved_model)?
+        }
+    };
+    Ok(client.with_prompt_cache(PromptCache::new(session_id)))
 }
 
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
@@ -6872,7 +6884,7 @@ fn load_runtime_oauth_config_for(cwd: &Path) -> Result<Option<OAuthConfig>, api:
     Ok(config.oauth().cloned())
 }
 
-impl ApiClient for AnthropicRuntimeClient {
+impl ApiClient for ApiRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         if let Some(progress_reporter) = &self.progress_reporter {
@@ -7802,7 +7814,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));
@@ -8711,6 +8723,64 @@ mod tests {
         }
         std::fs::remove_dir_all(workspace).expect("temp workspace should clean up");
         std::fs::remove_dir_all(config_home).expect("temp config home should clean up");
+    }
+
+    #[test]
+    fn build_cli_provider_client_routes_explicit_bedrock_models() {
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        std::fs::create_dir_all(&workspace).expect("workspace should exist");
+
+        let original_access_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let original_secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        let original_region = std::env::var("AWS_REGION").ok();
+        let original_bedrock_base_url = std::env::var("BEDROCK_BASE_URL").ok();
+        let original_anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        let original_anthropic_auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+        std::env::set_var(
+            "AWS_SECRET_ACCESS_KEY",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        );
+        std::env::set_var("AWS_REGION", "us-east-1");
+        std::env::set_var("BEDROCK_BASE_URL", "https://example.bedrock.test");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+
+        let client = super::build_cli_provider_client_for_cwd(
+            &workspace,
+            "session-bedrock",
+            "us.anthropic.claude-sonnet-4-6",
+        )
+        .expect("bedrock client should resolve");
+
+        match original_access_key {
+            Some(value) => std::env::set_var("AWS_ACCESS_KEY_ID", value),
+            None => std::env::remove_var("AWS_ACCESS_KEY_ID"),
+        }
+        match original_secret_key {
+            Some(value) => std::env::set_var("AWS_SECRET_ACCESS_KEY", value),
+            None => std::env::remove_var("AWS_SECRET_ACCESS_KEY"),
+        }
+        match original_region {
+            Some(value) => std::env::set_var("AWS_REGION", value),
+            None => std::env::remove_var("AWS_REGION"),
+        }
+        match original_bedrock_base_url {
+            Some(value) => std::env::set_var("BEDROCK_BASE_URL", value),
+            None => std::env::remove_var("BEDROCK_BASE_URL"),
+        }
+        match original_anthropic_api_key {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        match original_anthropic_auth_token {
+            Some(value) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", value),
+            None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
+        }
+        std::fs::remove_dir_all(workspace).expect("temp workspace should clean up");
+
+        assert_eq!(client.provider_kind(), api::ProviderKind::Bedrock);
     }
 
     #[test]
