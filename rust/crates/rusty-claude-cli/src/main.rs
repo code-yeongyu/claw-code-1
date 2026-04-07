@@ -7458,14 +7458,18 @@ fn collect_subagent_output_sections(
 
     for raw_line in text.lines() {
         if let Some((label, content)) = parse_subagent_output_line(raw_line) {
-            let section_index = *section_indexes.entry(label.clone()).or_insert_with(|| {
-                let index = sections.len();
-                sections.push(SubagentOutputSection {
-                    label,
-                    lines: Vec::new(),
+            let normalized_label =
+                canonical_subagent_section_label(&label).unwrap_or_else(|| label.clone());
+            let section_index = *section_indexes
+                .entry(normalized_label.clone())
+                .or_insert_with(|| {
+                    let index = sections.len();
+                    sections.push(SubagentOutputSection {
+                        label: normalized_label,
+                        lines: Vec::new(),
+                    });
+                    index
                 });
-                index
-            });
             current_section = Some(section_index);
             if !content.is_empty() {
                 sections[section_index].lines.push(content);
@@ -7567,25 +7571,36 @@ fn looks_like_subagent_label(label: &str) -> bool {
     if !is_simple_subagent_label(label) {
         return false;
     }
+    if canonical_subagent_section_label(label).is_some() {
+        return true;
+    }
     let lower = label.to_ascii_lowercase();
-    [
-        "agent",
-        "task",
-        "atlas",
-        "sisyphus",
-        "junior",
-        "worker",
-        "oracle",
-        "librarian",
-        "explore",
-        "plan",
-        "review",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    ["agent", "task", "atlas", "sisyphus", "junior", "worker"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn canonical_subagent_section_label(label: &str) -> Option<String> {
+    let normalized = label.trim().to_ascii_lowercase();
+    let canonical = match normalized.as_str() {
+        "explore" | "exploring" | "research" => "Explore",
+        "implementation" | "implementing" | "implement" => "Implementation",
+        "verification" | "verifying" | "verify" => "Verification",
+        "plan" | "planning" => "Plan",
+        "review" | "reviewing" => "Review",
+        "oracle" => "Oracle",
+        "librarian" => "Librarian",
+        "general" => "General",
+        _ => return None,
+    };
+    Some(canonical.to_string())
 }
 
 fn render_subagent_section(section: &SubagentOutputSection) -> String {
+    if canonical_subagent_section_label(&section.label).is_some() {
+        return render_subagent_type_section(section);
+    }
+
     let border = "─".repeat(section.label.chars().count() + 4);
     let body = render_labeled_output_block(&section.label, &section.lines.join("\n"));
     let indented_body = body
@@ -7600,6 +7615,20 @@ fn render_subagent_section(section: &SubagentOutputSection) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("╭─ {} ─╮\n{}\n╰{}╯", section.label, indented_body, border)
+}
+
+fn render_subagent_type_section(section: &SubagentOutputSection) -> String {
+    let header = format!(r"\-\-\- {} \-\-\-", section.label);
+    let body = truncate_output_for_display(
+        &section.lines.join("\n"),
+        SUBAGENT_OUTPUT_DISPLAY_MAX_LINES,
+        SUBAGENT_OUTPUT_DISPLAY_MAX_CHARS,
+    );
+    if body.trim().is_empty() {
+        header
+    } else {
+        format!("{header}\n{body}")
+    }
 }
 
 fn render_labeled_output_block(label: &str, text: &str) -> String {
@@ -8441,6 +8470,7 @@ mod tests {
         InternalPromptProgressState, LaneRecord, LiveCli, LocalHelpTopic, SlashCommand,
         StatusUsage, TaskCliAction, DEFAULT_MODEL, STALL_THRESHOLD_MS,
     };
+    use crate::render::TerminalRenderer;
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
@@ -8460,6 +8490,28 @@ mod tests {
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
+
+    fn strip_ansi_for_test(input: &str) -> String {
+        let mut output = String::new();
+        let mut chars = input.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if next.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                output.push(ch);
+            }
+        }
+
+        output
+    }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
         GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(
@@ -11068,6 +11120,33 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn tool_rendering_groups_task_output_by_agent_type_headers() {
+        // given
+        let output = json!({
+            "task_id": "task_render_43",
+            "output": "Explore: Found task renderer in main.rs\nImplementation: Added grouped section headers\nImplementation: Preserved agent-name boxes\nVerification: Added rendering coverage"
+        })
+        .to_string();
+
+        // when
+        let rendered = format_tool_result("TaskOutput", &output, false);
+        let plain_text = strip_ansi_for_test(&TerminalRenderer::new().markdown_to_ansi(&rendered));
+
+        // then
+        assert!(plain_text.contains("▶ Task task_render_43"), "{plain_text}");
+        assert!(plain_text.contains("--- Explore ---"), "{plain_text}");
+        assert!(
+            plain_text.contains("--- Implementation ---"),
+            "{plain_text}"
+        );
+        assert!(plain_text.contains("--- Verification ---"), "{plain_text}");
+        assert!(
+            plain_text.contains("Added grouped section headers"),
+            "{plain_text}"
+        );
+    }
+
+    #[test]
     fn tool_rendering_formats_agent_manifest_with_clear_header() {
         // given
         let temp_root = temp_dir();
@@ -11382,6 +11461,52 @@ UU conflicted.rs",
         assert!(rendered.contains("╭─ Tests ─╮"), "{rendered}");
         assert!(
             rendered.contains("[Renderer] Added clear separators"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn response_to_events_groups_agent_type_sections_for_display_only() {
+        // given
+        let mut out = Vec::new();
+        let assistant_text = "Explore: Found flat task transcript rendering\nImplementation: Added grouped output headers\nVerification: Added REPL rendering test";
+
+        // when
+        let events = response_to_events(
+            MessageResponse {
+                id: "msg-agent-types".to_string(),
+                kind: "message".to_string(),
+                model: "claude-opus-4-6".to_string(),
+                role: "assistant".to_string(),
+                content: vec![OutputContentBlock::Text {
+                    text: assistant_text.to_string(),
+                }],
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                request_id: None,
+            },
+            &mut out,
+        )
+        .expect("response conversion should succeed");
+
+        // then
+        assert!(matches!(
+            &events[0],
+            AssistantEvent::TextDelta(text) if text == assistant_text
+        ));
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(rendered.contains("Sub-agent output"), "{rendered}");
+        assert!(rendered.contains("--- Explore ---"), "{rendered}");
+        assert!(rendered.contains("--- Implementation ---"), "{rendered}");
+        assert!(rendered.contains("--- Verification ---"), "{rendered}");
+        assert!(
+            rendered.contains("Added grouped output headers"),
             "{rendered}"
         );
     }
