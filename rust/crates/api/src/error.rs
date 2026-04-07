@@ -19,6 +19,8 @@ const CONTEXT_WINDOW_ERROR_MARKERS: &[&str] = &[
     "request is too large",
 ];
 
+const OPENAI_BETAS_ERROR_MARKERS: &[&str] = &["betas"];
+
 #[derive(Debug)]
 pub enum ApiError {
     MissingCredentials {
@@ -99,6 +101,64 @@ impl ApiError {
             | Self::Json(_)
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn status(&self) -> Option<reqwest::StatusCode> {
+        match self {
+            Self::Api { status, .. } => Some(*status),
+            Self::RetriesExhausted { last_error, .. } => last_error.status(),
+            Self::MissingCredentials { .. }
+            | Self::ContextWindowExceeded { .. }
+            | Self::ExpiredOAuthToken
+            | Self::Auth(_)
+            | Self::InvalidApiKeyEnv(_)
+            | Self::Http(_)
+            | Self::Io(_)
+            | Self::Json(_)
+            | Self::InvalidSseFrame(_)
+            | Self::BackoffOverflow { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Api { message, body, .. } => {
+                let detail = message.as_deref().unwrap_or(body).trim();
+                (!detail.is_empty()).then_some(detail)
+            }
+            Self::RetriesExhausted { last_error, .. } => last_error.detail(),
+            Self::MissingCredentials { .. }
+            | Self::ContextWindowExceeded { .. }
+            | Self::ExpiredOAuthToken
+            | Self::Auth(_)
+            | Self::InvalidApiKeyEnv(_)
+            | Self::Http(_)
+            | Self::Io(_)
+            | Self::Json(_)
+            | Self::InvalidSseFrame(_)
+            | Self::BackoffOverflow { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn remediation_hint(&self) -> Option<&'static str> {
+        match self.status().map(|status| status.as_u16()) {
+            Some(400) if self.detail().is_some_and(looks_like_openai_betas_error) => Some(
+                "Check OPENAI_BASE_URL. This usually means claw is pointed at an OpenAI-compatible endpoint that rejects Anthropic-style betas fields. Unset OPENAI_BASE_URL to use Anthropic directly, or point it at a compatible proxy.",
+            ),
+            Some(401) => Some(
+                "Check your API credentials. Verify the relevant env var is set with a valid key/token: ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY, or XAI_API_KEY.",
+            ),
+            Some(403) => Some(
+                "Check your provider account, billing, and model access. This usually means your plan or organization does not allow this request yet.",
+            ),
+            Some(429) => Some(
+                "You are being rate limited. Wait and retry, reduce request volume, or raise your provider rate limits if available.",
+            ),
+            _ => None,
         }
     }
 
@@ -309,6 +369,13 @@ fn looks_like_context_window_error(text: &str) -> bool {
         .any(|marker| lowered.contains(marker))
 }
 
+fn looks_like_openai_betas_error(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    OPENAI_BETAS_ERROR_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
 #[cfg(test)]
 mod tests {
     use std::env::VarError;
@@ -445,5 +512,47 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(error.to_failure_class(), expected);
         }
+    }
+
+    #[test]
+    fn given_openai_betas_error_when_remediation_hint_requested_then_mentions_openai_base_url() {
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: Some("invalid_request_error".to_string()),
+            message: Some("betas: Extra inputs are not permitted".to_string()),
+            request_id: Some("req_beta_123".to_string()),
+            body: String::new(),
+            retryable: false,
+        };
+
+        assert_eq!(error.status(), Some(reqwest::StatusCode::BAD_REQUEST));
+        assert_eq!(
+            error.detail(),
+            Some("betas: Extra inputs are not permitted")
+        );
+        assert!(error
+            .remediation_hint()
+            .is_some_and(|hint| hint.contains("OPENAI_BASE_URL")));
+    }
+
+    #[test]
+    fn given_retry_wrapped_auth_error_when_remediation_hint_requested_then_it_uses_nested_status() {
+        let error = ApiError::RetriesExhausted {
+            attempts: 2,
+            last_error: Box::new(ApiError::Api {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                error_type: Some("authentication_error".to_string()),
+                message: Some("Invalid bearer token".to_string()),
+                request_id: Some("req_auth_123".to_string()),
+                body: String::new(),
+                retryable: false,
+            }),
+        };
+
+        assert_eq!(error.status(), Some(reqwest::StatusCode::UNAUTHORIZED));
+        assert_eq!(error.detail(), Some("Invalid bearer token"));
+        assert!(error
+            .remediation_hint()
+            .is_some_and(|hint| hint.contains("ANTHROPIC_AUTH_TOKEN")));
     }
 }
