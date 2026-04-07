@@ -7345,6 +7345,9 @@ fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
 
     let parsed: serde_json::Value =
         serde_json::from_str(output).unwrap_or(serde_json::Value::String(output.to_string()));
+    if let Some(rendered) = format_subagent_tool_result(icon, name, output, &parsed) {
+        return rendered;
+    }
     match name {
         "bash" | "Bash" => format_bash_result(icon, &parsed),
         "read_file" | "Read" => format_read_result(icon, &parsed),
@@ -7362,6 +7365,243 @@ const READ_DISPLAY_MAX_LINES: usize = 80;
 const READ_DISPLAY_MAX_CHARS: usize = 6_000;
 const TOOL_OUTPUT_DISPLAY_MAX_LINES: usize = 60;
 const TOOL_OUTPUT_DISPLAY_MAX_CHARS: usize = 4_000;
+const SUBAGENT_OUTPUT_DISPLAY_MAX_LINES: usize = 18;
+const SUBAGENT_OUTPUT_DISPLAY_MAX_CHARS: usize = 1_600;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubagentOutputSection {
+    label: String,
+    lines: Vec<String>,
+}
+
+fn format_subagent_tool_result(
+    icon: &str,
+    name: &str,
+    output: &str,
+    parsed: &serde_json::Value,
+) -> Option<String> {
+    if name.eq_ignore_ascii_case("Agent") {
+        return load_agent_manifest_from_tool_output(output)
+            .ok()
+            .map(|manifest| format_agent_manifest_result(icon, name, &manifest));
+    }
+
+    let task_id = parsed.get("task_id").and_then(serde_json::Value::as_str)?;
+    let task_output = parsed.get("output").and_then(serde_json::Value::as_str)?;
+    let grouped =
+        maybe_format_grouped_subagent_output(&format!("Task {task_id}"), task_output, true)
+            .unwrap_or_else(|| render_labeled_output_block(task_id, task_output));
+    Some(format!("{icon} \x1b[38;5;245m{name}\x1b[0m\n{grouped}"))
+}
+
+fn format_agent_manifest_result(
+    icon: &str,
+    tool_name: &str,
+    manifest: &tools::AgentManifestSnapshot,
+) -> String {
+    let subagent_type = manifest.subagent_type.as_deref().unwrap_or("General");
+    format!(
+        "{icon} \x1b[38;5;245m{tool_name}\x1b[0m\n▶ Agent {name} · {subagent_type} · {status}\n  id             {id}\n  output         {output}\n  manifest       {manifest_file}",
+        name = manifest.name,
+        status = manifest.status,
+        id = manifest.agent_id,
+        output = manifest.output_file,
+        manifest_file = manifest.manifest_file,
+    )
+}
+
+fn maybe_format_grouped_subagent_output(
+    title: &str,
+    text: &str,
+    require_multiple_sections: bool,
+) -> Option<String> {
+    let (preamble, sections) = collect_subagent_output_sections(text, require_multiple_sections)?;
+    let mut rendered = Vec::new();
+    if !preamble.trim().is_empty() {
+        rendered.push(preamble.trim_end().to_string());
+        rendered.push(String::new());
+    }
+    rendered.push(format!("▶ {title}"));
+    for section in sections {
+        rendered.push(String::new());
+        rendered.push(render_subagent_section(&section));
+    }
+    Some(rendered.join("\n"))
+}
+
+fn collect_subagent_output_sections(
+    text: &str,
+    require_multiple_sections: bool,
+) -> Option<(String, Vec<SubagentOutputSection>)> {
+    let mut preamble = Vec::new();
+    let mut sections = Vec::new();
+    let mut section_indexes = BTreeMap::new();
+    let mut current_section = None;
+
+    for raw_line in text.lines() {
+        if let Some((label, content)) = parse_subagent_output_line(raw_line) {
+            let section_index = *section_indexes.entry(label.clone()).or_insert_with(|| {
+                let index = sections.len();
+                sections.push(SubagentOutputSection {
+                    label,
+                    lines: Vec::new(),
+                });
+                index
+            });
+            current_section = Some(section_index);
+            if !content.is_empty() {
+                sections[section_index].lines.push(content);
+            }
+            continue;
+        }
+
+        match current_section {
+            Some(index) => sections[index].lines.push(raw_line.trim_end().to_string()),
+            None => preamble.push(raw_line.trim_end().to_string()),
+        }
+    }
+
+    sections.retain(|section| section.lines.iter().any(|line| !line.trim().is_empty()));
+    if sections.is_empty() {
+        return None;
+    }
+    if require_multiple_sections && sections.len() < 2 {
+        return None;
+    }
+
+    Some((preamble.join("\n"), sections))
+}
+
+fn parse_subagent_output_line(line: &str) -> Option<(String, String)> {
+    parse_bracketed_subagent_line(line)
+        .or_else(|| parse_bold_subagent_line(line))
+        .or_else(|| parse_heading_subagent_line(line))
+        .or_else(|| parse_colon_subagent_line(line))
+}
+
+fn parse_bracketed_subagent_line(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim_start();
+    let trimmed = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .unwrap_or(trimmed);
+    let remainder = trimmed.strip_prefix('[')?;
+    let closing = remainder.find(']')?;
+    let label = remainder[..closing].trim();
+    if !is_simple_subagent_label(label) {
+        return None;
+    }
+    let content = remainder[closing + 1..]
+        .trim_start_matches([':', '-', '—', ' '])
+        .trim()
+        .to_string();
+    Some((label.to_string(), content))
+}
+
+fn parse_bold_subagent_line(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim_start();
+    let trimmed = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .unwrap_or(trimmed);
+    let remainder = trimmed.strip_prefix("**")?;
+    let closing = remainder.find("**")?;
+    let label = remainder[..closing].trim();
+    if !is_simple_subagent_label(label) {
+        return None;
+    }
+    let content = remainder[closing + 2..]
+        .trim_start_matches([':', '-', '—', ' '])
+        .trim()
+        .to_string();
+    Some((label.to_string(), content))
+}
+
+fn parse_heading_subagent_line(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    let heading = trimmed.trim_start_matches('#').trim();
+    if heading == trimmed || !looks_like_subagent_label(heading) {
+        return None;
+    }
+    Some((heading.to_string(), String::new()))
+}
+
+fn parse_colon_subagent_line(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim_start();
+    let (label, content) = trimmed.split_once(':')?;
+    let label = label.trim();
+    if !looks_like_subagent_label(label) {
+        return None;
+    }
+    Some((label.to_string(), content.trim().to_string()))
+}
+
+fn is_simple_subagent_label(label: &str) -> bool {
+    let trimmed = label.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 48
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_' | '/' | '.' | '#'))
+}
+
+fn looks_like_subagent_label(label: &str) -> bool {
+    if !is_simple_subagent_label(label) {
+        return false;
+    }
+    let lower = label.to_ascii_lowercase();
+    [
+        "agent",
+        "task",
+        "atlas",
+        "sisyphus",
+        "junior",
+        "worker",
+        "oracle",
+        "librarian",
+        "explore",
+        "plan",
+        "review",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn render_subagent_section(section: &SubagentOutputSection) -> String {
+    let border = "─".repeat(section.label.chars().count() + 4);
+    let body = render_labeled_output_block(&section.label, &section.lines.join("\n"));
+    let indented_body = body
+        .lines()
+        .map(|line| {
+            if line.is_empty() {
+                "│".to_string()
+            } else {
+                format!("│ {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("╭─ {} ─╮\n{}\n╰{}╯", section.label, indented_body, border)
+}
+
+fn render_labeled_output_block(label: &str, text: &str) -> String {
+    let prefixed = text
+        .lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                format!("[{label}] {}", line.trim_end())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    truncate_output_for_display(
+        &prefixed,
+        SUBAGENT_OUTPUT_DISPLAY_MAX_LINES,
+        SUBAGENT_OUTPUT_DISPLAY_MAX_CHARS,
+    )
+}
 
 fn extract_tool_path(parsed: &serde_json::Value) -> String {
     parsed
@@ -7736,7 +7976,10 @@ fn push_output_block(
     match block {
         OutputContentBlock::Text { text } => {
             if !text.is_empty() {
-                let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
+                let display_text =
+                    maybe_format_grouped_subagent_output("Sub-agent output", &text, true)
+                        .unwrap_or_else(|| text.clone());
+                let rendered = TerminalRenderer::new().markdown_to_ansi(&display_text);
                 write!(out, "{rendered}")
                     .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -10663,6 +10906,77 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn tool_rendering_groups_task_output_by_agent_prefix() {
+        // given
+        let output = json!({
+            "task_id": "task_render_42",
+            "output": "[Atlas] Coordinating renderer fix\n[Renderer] Updated response_to_events\n[Renderer] Added task grouping headers\n[Tests] Added coverage"
+        })
+        .to_string();
+
+        // when
+        let rendered = format_tool_result("TaskOutput", &output, false);
+
+        // then
+        assert!(rendered.contains("TaskOutput"));
+        assert!(rendered.contains("▶ Task task_render_42"), "{rendered}");
+        assert!(rendered.contains("╭─ Atlas ─╮"), "{rendered}");
+        assert!(rendered.contains("╭─ Renderer ─╮"), "{rendered}");
+        assert!(rendered.contains("╭─ Tests ─╮"), "{rendered}");
+        assert!(
+            rendered.contains("[Renderer] Updated response_to_events"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn tool_rendering_formats_agent_manifest_with_clear_header() {
+        // given
+        let temp_root = temp_dir();
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+        let manifest_path = temp_root.join("atlas-renderer.json");
+        fs::write(
+            &manifest_path,
+            json!({
+                "agentId": "agent_atlas_renderer",
+                "name": "Atlas",
+                "description": "Renderer coordination",
+                "subagentType": "Explore",
+                "model": "claude-opus-4-6",
+                "status": "running",
+                "outputFile": temp_root.join("atlas-renderer.md").display().to_string(),
+                "manifestFile": manifest_path.display().to_string(),
+                "createdAt": "2026-04-07T00:00:00Z",
+                "startedAt": "2026-04-07T00:00:01Z",
+                "derivedState": "working"
+            })
+            .to_string(),
+        )
+        .expect("manifest should write");
+        let tool_output = json!({
+            "agentId": "agent_atlas_renderer",
+            "manifestFile": manifest_path.display().to_string(),
+        })
+        .to_string();
+
+        // when
+        let rendered = format_tool_result("Agent", &tool_output, false);
+
+        // then
+        assert!(
+            rendered.contains("▶ Agent Atlas · Explore · running"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("agent_atlas_renderer"), "{rendered}");
+        assert!(
+            rendered.contains(&manifest_path.display().to_string()),
+            "{rendered}"
+        );
+
+        fs::remove_dir_all(temp_root).expect("temp root should clean up");
+    }
+
+    #[test]
     fn ultraplan_progress_lines_include_phase_step_and_elapsed_status() {
         let snapshot = InternalPromptProgressState {
             command_label: "Ultraplan",
@@ -10886,6 +11200,52 @@ UU conflicted.rs",
         let rendered = String::from_utf8(out).expect("utf8");
         assert!(rendered.contains("▶ Thinking (6 chars hidden)"));
         assert!(!rendered.contains("step 1"));
+    }
+
+    #[test]
+    fn response_to_events_groups_subagent_output_for_display_only() {
+        // given
+        let mut out = Vec::new();
+        let assistant_text = "[Atlas] Coordinating renderer fix\n[Renderer] Updated response_to_events\n[Renderer] Added clear separators\n[Tests] Added coverage";
+
+        // when
+        let events = response_to_events(
+            MessageResponse {
+                id: "msg-subagents".to_string(),
+                kind: "message".to_string(),
+                model: "claude-opus-4-6".to_string(),
+                role: "assistant".to_string(),
+                content: vec![OutputContentBlock::Text {
+                    text: assistant_text.to_string(),
+                }],
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                request_id: None,
+            },
+            &mut out,
+        )
+        .expect("response conversion should succeed");
+
+        // then
+        assert!(matches!(
+            &events[0],
+            AssistantEvent::TextDelta(text) if text == assistant_text
+        ));
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(rendered.contains("Sub-agent output"), "{rendered}");
+        assert!(rendered.contains("╭─ Atlas ─╮"), "{rendered}");
+        assert!(rendered.contains("╭─ Renderer ─╮"), "{rendered}");
+        assert!(rendered.contains("╭─ Tests ─╮"), "{rendered}");
+        assert!(
+            rendered.contains("[Renderer] Added clear separators"),
+            "{rendered}"
+        );
     }
 
     #[test]
