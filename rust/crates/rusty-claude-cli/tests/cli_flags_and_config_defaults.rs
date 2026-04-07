@@ -186,6 +186,32 @@ fn config_command_loads_defaults_from_standard_config_locations() {
 }
 
 #[test]
+fn repl_startup_output_reports_resolved_model_name() {
+    // given
+    let temp_dir = unique_temp_dir("repl-startup-model");
+    let config_home = temp_dir.join("home").join(".claw");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::write(config_home.join("settings.json"), r#"{"model":"haiku"}"#)
+        .expect("write user settings");
+
+    // when
+    let output = command_in(&temp_dir)
+        .env("CLAW_CONFIG_HOME", &config_home)
+        .env("ANTHROPIC_API_KEY", "test-dummy-key-for-repl-startup")
+        .output()
+        .expect("claw should launch");
+
+    // then
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("Connected: claude-haiku-4-5-20251213 via Anthropic"));
+    assert!(stdout.contains("claude-haiku-4-5-20251213"));
+
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
+#[test]
 fn doctor_command_runs_as_a_local_shell_entrypoint() {
     // given
     let temp_dir = unique_temp_dir("doctor-entrypoint");

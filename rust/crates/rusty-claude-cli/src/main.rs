@@ -323,7 +323,7 @@ impl CliOutputFormat {
 
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    let mut model = DEFAULT_MODEL.to_string();
+    let mut model = default_model_for_current_dir();
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
     let mut wants_help = false;
@@ -901,6 +901,18 @@ fn default_permission_mode() -> PermissionMode {
         .map(permission_mode_from_label)
         .or_else(config_permission_mode_for_current_dir)
         .unwrap_or(PermissionMode::DangerFullAccess)
+}
+
+fn default_model_for_current_dir() -> String {
+    env::current_dir()
+        .ok()
+        .and_then(|cwd| {
+            ConfigLoader::default_for(&cwd)
+                .load()
+                .ok()
+                .and_then(|runtime_config| runtime_config.model().map(api::resolve_model_alias))
+        })
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
 }
 
 fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
@@ -2708,6 +2720,7 @@ fn run_repl(
     let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
+    println!("{}", cli.startup_connection_line());
     println!("{}", cli.startup_banner());
 
     loop {
@@ -3319,6 +3332,14 @@ impl LiveCli {
             cwd,
             self.session.id,
             session_path,
+        )
+    }
+
+    fn startup_connection_line(&self) -> String {
+        format!(
+            "Connected: {} via {}",
+            self.model,
+            provider_label(api::detect_provider_kind(&self.model))
         )
     }
 
@@ -4175,6 +4196,15 @@ impl LiveCli {
     fn run_issue(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", format_issue_report(context));
         Ok(())
+    }
+}
+
+fn provider_label(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Anthropic => "Anthropic",
+        ProviderKind::Bedrock => "Bedrock",
+        ProviderKind::Xai => "xAI",
+        ProviderKind::OpenAi => "OpenAI",
     }
 }
 
