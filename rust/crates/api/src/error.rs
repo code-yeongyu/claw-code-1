@@ -205,8 +205,8 @@ impl Display for ApiError {
         match self {
             Self::MissingCredentials { provider, env_vars } => write!(
                 f,
-                "missing {provider} credentials; export {} before calling the {provider} API",
-                env_vars.join(" or ")
+                "{}",
+                format_missing_credentials_message(provider, env_vars, std::env::consts::OS)
             ),
             Self::ContextWindowExceeded {
                 model,
@@ -269,6 +269,31 @@ impl Display for ApiError {
     }
 }
 
+fn format_missing_credentials_message(
+    provider: &str,
+    env_vars: &[&str],
+    operating_system: &str,
+) -> String {
+    let mut message = format!(
+        "missing {provider} credentials; export {} before calling the {provider} API",
+        env_vars.join(" or ")
+    );
+
+    if operating_system == "windows" {
+        let preferred_key = env_vars
+            .iter()
+            .find(|name| name.ends_with("_API_KEY"))
+            .copied()
+            .or_else(|| env_vars.first().copied())
+            .unwrap_or("ANTHROPIC_API_KEY");
+        message.push_str(&format!(
+            ". On Windows, PowerShell variables do not always reach claw.exe; set `$env:{preferred_key}=\"...\"` in the same PowerShell session or put `{preferred_key}=...` in a `.env` file in the current working directory"
+        ));
+    }
+
+    message
+}
+
 impl std::error::Error for ApiError {}
 
 impl From<reqwest::Error> for ApiError {
@@ -315,7 +340,7 @@ mod tests {
 
     use runtime::FailureClass;
 
-    use super::ApiError;
+    use super::{format_missing_credentials_message, ApiError};
 
     #[test]
     fn detects_generic_fatal_wrapper_and_classifies_it_as_provider_internal() {
@@ -445,5 +470,23 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(error.to_failure_class(), expected);
         }
+    }
+
+    #[test]
+    fn missing_credentials_message_includes_windows_powershell_hint() {
+        // given
+
+        // when
+        let rendered = format_missing_credentials_message(
+            "Anthropic",
+            &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
+            "windows",
+        );
+
+        // then
+        assert!(rendered.contains("PowerShell"));
+        assert!(rendered.contains("claw.exe"));
+        assert!(rendered.contains(".env"));
+        assert!(rendered.contains("ANTHROPIC_API_KEY"));
     }
 }

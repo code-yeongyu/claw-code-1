@@ -1,4 +1,5 @@
 mod client;
+mod env_fallback;
 mod error;
 mod prompt_cache;
 mod providers;

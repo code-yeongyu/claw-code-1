@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, SessionTracer};
 
 use crate::error::ApiError;
+use crate::env_fallback::read_env_non_empty;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
 use super::{
@@ -695,14 +696,6 @@ fn now_unix_timestamp() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
-fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
-    match std::env::var(key) {
-        Ok(value) if !value.is_empty() => Ok(Some(value)),
-        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(ApiError::from(error)),
-    }
-}
-
 fn openai_base_url_disables_oauth() -> Result<bool, ApiError> {
     Ok(read_env_non_empty("OPENAI_BASE_URL")?.is_some())
 }
@@ -733,7 +726,10 @@ fn read_auth_token() -> Option<String> {
 
 #[must_use]
 pub fn read_base_url() -> String {
-    std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
+    read_env_non_empty("ANTHROPIC_BASE_URL")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
 }
 
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
