@@ -500,3 +500,13 @@ to:
   3. `claw lanes` and `claw status` should surface dirty-worktree state as a warning
   4. Alternatively: add a `post_completion_hook` that runs `git status --porcelain` and blocks the `completed` transition if dirty
 **Acceptance:** A session with `commit_policy: Required` either commits before completing, or transitions to `blocked` with `uncommitted_changes` as the blocker class instead of reporting clean completion.
+
+## #40 — ROADMAP drift: stale backlog items waste parallel lane effort
+**Status:** Backlog
+**Pinpoint:** ROADMAP items marked as backlog can become stale when the code ships ahead of the doc update. During a 10-session parallel batch, one lane spent a full cycle re-verifying #30 (claw lanes live state) only to discover it was already implemented. The session correctly identified the code was present and tests passed, but the effort was wasted — that slot could have worked on an actual gap.
+**Observed:** 2026-04-07, session `ses_29a689f3cffe1PfpJ7WnT0o6k4` picked up #30, found `load_live_lanes()` already shipped with tests, reported no-op.
+**Action:**
+  1. Add a `claw roadmap audit` command that cross-references ROADMAP items against git history / test presence and flags likely-shipped entries
+  2. Alternatively: require each completed session to mark its ROADMAP item as `Done` with commit hash before reporting completion
+  3. At batch-spawn time, pre-filter ROADMAP items against a quick `grep` for key function/test names to avoid assigning already-implemented work
+**Acceptance:** A 10-session batch does not assign any lane to a ROADMAP item whose acceptance criteria are already met in the current tree.
