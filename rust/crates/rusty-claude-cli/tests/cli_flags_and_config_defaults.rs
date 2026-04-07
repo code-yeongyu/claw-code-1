@@ -282,7 +282,8 @@ fn login_command_fails_fast_when_openai_base_url_is_set() {
     );
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
     assert!(stderr.contains("OPENAI_BASE_URL"), "{stderr}");
-    assert!(stderr.contains("API key auth"), "{stderr}");
+    assert!(stderr.contains("Anthropic OAuth will not work"), "{stderr}");
+    assert!(stderr.contains("ANTHROPIC_API_KEY"), "{stderr}");
     assert!(stderr.contains("claw login"), "{stderr}");
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");

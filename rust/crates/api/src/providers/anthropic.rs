@@ -21,7 +21,7 @@ use crate::sse::SseParser;
 use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
-const OPENAI_BASE_URL_OAUTH_UNSUPPORTED_MESSAGE: &str = "OAuth authentication is only supported for Anthropic. OPENAI_BASE_URL is set, so saved OAuth credentials are disabled. Use API key auth for your OpenAI-compatible provider instead, or unset OPENAI_BASE_URL and run `claw login` again.";
+const OPENAI_BASE_URL_OAUTH_UNSUPPORTED_MESSAGE: &str = "Anthropic OAuth will not work when OPENAI_BASE_URL is set to a custom provider. `claw login` only supports Anthropic OAuth. Use ANTHROPIC_API_KEY instead, or unset OPENAI_BASE_URL and run `claw login` again.";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
