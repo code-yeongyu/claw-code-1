@@ -1769,6 +1769,12 @@ fn default_oauth_config() -> OAuthConfig {
 }
 
 fn run_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("OPENAI_BASE_URL")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(io::Error::other(api::oauth_unsupported_for_openai_base_url_message()).into());
+    }
     let cwd = env::current_dir()?;
     let config = ConfigLoader::default_for(&cwd).load()?;
     let default_oauth = default_oauth_config();
@@ -8185,8 +8191,9 @@ mod tests {
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
     use runtime::{
-        load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
-        ConversationMessage, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
+        clear_oauth_credentials, load_oauth_credentials, save_oauth_credentials, AssistantEvent,
+        ConfigLoader, ContentBlock, ConversationMessage, MessageRole, OAuthConfig, PermissionMode,
+        Session, ToolExecutor,
     };
     use serde_json::json;
     use std::fs;
@@ -8601,6 +8608,7 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("OPENAI_BASE_URL");
 
         save_oauth_credentials(&runtime::OAuthTokenSet {
             access_token: "expired-access-token".to_string(),
@@ -8643,6 +8651,66 @@ mod tests {
             stored.refresh_token.as_deref(),
             Some("refreshed-refresh-token")
         );
+    }
+
+    #[test]
+    fn resolve_cli_auth_source_rejects_saved_oauth_when_openai_base_url_is_set() {
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        let config_home = temp_dir();
+        std::fs::create_dir_all(&workspace).expect("workspace should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        let original_auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
+        let original_openai_base_url = std::env::var("OPENAI_BASE_URL").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::set_var("OPENAI_BASE_URL", "https://openai-compatible.example/v1");
+
+        save_oauth_credentials(&runtime::OAuthTokenSet {
+            access_token: "saved-access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            expires_at: Some(4102444800),
+            scopes: vec!["org:create_api_key".to_string(), "user:profile".to_string()],
+        })
+        .expect("save oauth credentials");
+
+        let error = super::resolve_cli_auth_source_for_cwd(&workspace, || {
+            panic!("default OAuth config should not load when OPENAI_BASE_URL is set")
+        })
+        .expect_err("saved OAuth should be rejected when OPENAI_BASE_URL is set");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("OPENAI_BASE_URL"), "{rendered}");
+        assert!(rendered.contains("API key auth"), "{rendered}");
+
+        let stored = load_oauth_credentials()
+            .expect("load stored credentials")
+            .expect("stored credentials should exist");
+        assert_eq!(stored.access_token, "saved-access-token");
+
+        clear_oauth_credentials().expect("clear credentials");
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_api_key {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        match original_auth_token {
+            Some(value) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", value),
+            None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
+        }
+        match original_openai_base_url {
+            Some(value) => std::env::set_var("OPENAI_BASE_URL", value),
+            None => std::env::remove_var("OPENAI_BASE_URL"),
+        }
+        std::fs::remove_dir_all(workspace).expect("temp workspace should clean up");
+        std::fs::remove_dir_all(config_home).expect("temp config home should clean up");
     }
 
     #[test]

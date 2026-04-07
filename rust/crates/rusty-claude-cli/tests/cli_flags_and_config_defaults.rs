@@ -258,6 +258,36 @@ fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }
 
+#[test]
+fn login_command_fails_fast_when_openai_base_url_is_set() {
+    // given
+    let temp_dir = unique_temp_dir("login-openai-base-url");
+    let config_home = temp_dir.join("home").join(".claw");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+
+    // when
+    let output = command_in(&temp_dir)
+        .env("CLAW_CONFIG_HOME", &config_home)
+        .env("OPENAI_BASE_URL", "https://openai-compatible.example/v1")
+        .arg("login")
+        .output()
+        .expect("claw login should launch");
+
+    // then
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("OPENAI_BASE_URL"), "{stderr}");
+    assert!(stderr.contains("API key auth"), "{stderr}");
+    assert!(stderr.contains("claw login"), "{stderr}");
+
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
 fn command_in(cwd: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
     command.current_dir(cwd);
