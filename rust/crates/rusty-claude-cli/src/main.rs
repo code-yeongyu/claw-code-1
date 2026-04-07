@@ -7066,9 +7066,46 @@ fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> Str
             qualifiers.join(", "),
             error
         )
+    } else if let Some(rendered) = format_actionable_api_error(session_id, error) {
+        rendered
     } else {
         error.to_string()
     }
+}
+
+fn format_actionable_api_error(session_id: &str, error: &api::ApiError) -> Option<String> {
+    let status = error.status()?;
+    let hint = error.remediation_hint()?;
+    let title = match status.as_u16() {
+        400 => "Provider request rejected",
+        401 => "Authentication failed",
+        403 => "Access denied",
+        429 => "Rate limited",
+        _ => return None,
+    };
+
+    let mut lines = vec![
+        title.to_string(),
+        format!("  Failure class    {}", error.safe_failure_class()),
+        format!("  Session          {session_id}"),
+        format!("  HTTP status      {status}"),
+    ];
+
+    if let Some(request_id) = error.request_id() {
+        lines.push(format!("  Trace            {request_id}"));
+    }
+
+    if let Some(detail) = error.detail() {
+        lines.push(format!(
+            "  Detail           {}",
+            truncate_for_summary(detail, 160)
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push("Recovery".to_string());
+    lines.push(format!("  Hint             {hint}"));
+    Some(lines.join("\n"))
 }
 
 fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) -> String {
@@ -8633,6 +8670,95 @@ mod tests {
             rendered.contains("Resume compact   claw --resume session-issue-32 /compact"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn given_betas_bad_request_when_formatting_api_error_then_openai_base_url_hint_is_shown() {
+        let error = ApiError::Api {
+            status: "400".parse().expect("status"),
+            error_type: Some("invalid_request_error".to_string()),
+            message: Some("betas: Extra inputs are not permitted".to_string()),
+            request_id: Some("req_beta_456".to_string()),
+            body: String::new(),
+            retryable: false,
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-40", &error);
+        assert!(rendered.contains("Provider request rejected"), "{rendered}");
+        assert!(rendered.contains("Failure class    provider_error"), "{rendered}");
+        assert!(rendered.contains("Session          session-issue-40"), "{rendered}");
+        assert!(rendered.contains("HTTP status      400 Bad Request"), "{rendered}");
+        assert!(rendered.contains("Trace            req_beta_456"), "{rendered}");
+        assert!(
+            rendered.contains("Detail           betas: Extra inputs are not permitted"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Recovery"), "{rendered}");
+        assert!(rendered.contains("Hint             Check OPENAI_BASE_URL."), "{rendered}");
+    }
+
+    #[test]
+    fn given_unauthorized_error_when_formatting_api_error_then_api_key_env_hint_is_shown() {
+        let error = ApiError::Api {
+            status: "401".parse().expect("status"),
+            error_type: Some("authentication_error".to_string()),
+            message: Some("Invalid bearer token".to_string()),
+            request_id: Some("req_auth_456".to_string()),
+            body: String::new(),
+            retryable: false,
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-41", &error);
+        assert!(rendered.contains("Authentication failed"), "{rendered}");
+        assert!(rendered.contains("Failure class    provider_auth"), "{rendered}");
+        assert!(rendered.contains("HTTP status      401 Unauthorized"), "{rendered}");
+        assert!(rendered.contains("Detail           Invalid bearer token"), "{rendered}");
+        assert!(rendered.contains("ANTHROPIC_AUTH_TOKEN"), "{rendered}");
+        assert!(rendered.contains("OPENAI_API_KEY"), "{rendered}");
+        assert!(rendered.contains("XAI_API_KEY"), "{rendered}");
+    }
+
+    #[test]
+    fn given_forbidden_error_when_formatting_api_error_then_account_plan_hint_is_shown() {
+        let error = ApiError::Api {
+            status: "403".parse().expect("status"),
+            error_type: Some("permission_error".to_string()),
+            message: Some("Access denied for this model".to_string()),
+            request_id: Some("req_forbidden_456".to_string()),
+            body: String::new(),
+            retryable: false,
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-42", &error);
+        assert!(rendered.contains("Access denied"), "{rendered}");
+        assert!(rendered.contains("Failure class    provider_auth"), "{rendered}");
+        assert!(rendered.contains("HTTP status      403 Forbidden"), "{rendered}");
+        assert!(rendered.contains("provider account, billing, and model access"), "{rendered}");
+        assert!(rendered.contains("plan or organization"), "{rendered}");
+    }
+
+    #[test]
+    fn given_rate_limited_error_when_formatting_api_error_then_rate_limit_hint_is_shown() {
+        let error = ApiError::RetriesExhausted {
+            attempts: 2,
+            last_error: Box::new(ApiError::Api {
+                status: "429".parse().expect("status"),
+                error_type: Some("rate_limit_error".to_string()),
+                message: Some("Rate limit exceeded".to_string()),
+                request_id: Some("req_rate_456".to_string()),
+                body: String::new(),
+                retryable: true,
+            }),
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-43", &error);
+        assert!(rendered.contains("Rate limited"), "{rendered}");
+        assert!(rendered.contains("Failure class    provider_rate_limit"), "{rendered}");
+        assert!(rendered.contains("HTTP status      429 Too Many Requests"), "{rendered}");
+        assert!(rendered.contains("Trace            req_rate_456"), "{rendered}");
+        assert!(rendered.contains("Detail           Rate limit exceeded"), "{rendered}");
+        assert!(rendered.contains("rate limited"), "{rendered}");
+        assert!(rendered.contains("Wait and retry"), "{rendered}");
     }
 
     fn temp_dir() -> PathBuf {
