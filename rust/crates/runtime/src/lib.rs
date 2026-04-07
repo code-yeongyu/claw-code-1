@@ -16,8 +16,8 @@ mod file_ops;
 pub mod green_contract;
 mod hooks;
 mod json;
-mod lane_spawn;
 mod lane_events;
+mod lane_spawn;
 pub mod lsp_client;
 mod mcp;
 mod mcp_client;
@@ -76,14 +76,14 @@ pub use green_contract::GreenLevel;
 pub use hooks::{
     HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
 };
+pub use lane_events::{
+    dedupe_superseded_commit_events, FailureClass, LaneCommitProvenance, LaneEvent,
+    LaneEventBlocker, LaneEventName, LaneEventStatus, LaneFailureClass,
+};
 pub use lane_spawn::{
     lane_spawn_request_from_packet, spawn_lane_from_packet, spawn_lane_with_runner,
     LaneSpawnCommandOutput, LaneSpawnCommandRunner, LaneSpawnCommandSpec, LaneSpawnMode,
     LaneSpawnRequest, LaneSpawnResult, LaneSpawnTransport, DEFAULT_LANE_SPAWN_TIMEOUT,
-};
-pub use lane_events::{
-    dedupe_superseded_commit_events, FailureClass, LaneCommitProvenance, LaneEvent,
-    LaneEventBlocker, LaneEventName, LaneEventStatus, LaneFailureClass,
 };
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
@@ -122,8 +122,8 @@ pub use plugin_lifecycle::{
     PluginState, ResourceInfo, ServerHealth, ServerStatus, ToolInfo,
 };
 pub use policy_engine::{
-    evaluate, DiffScope, LaneBlocker, LaneContext, PolicyAction, PolicyCondition,
-    PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus,
+    evaluate, DiffScope, LaneBlocker, LaneContext, PolicyAction, PolicyCondition, PolicyEngine,
+    PolicyRule, ReconcileReason, ReviewStatus,
 };
 pub use prompt::{
     load_system_prompt, prepend_bullets, ContextFile, ProjectContext, PromptBuildError,

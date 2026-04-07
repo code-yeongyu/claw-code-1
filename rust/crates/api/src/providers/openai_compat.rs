@@ -66,7 +66,7 @@ impl OpenAiCompatConfig {
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
-    api_key: String,
+    api_key: Option<String>,
     config: OpenAiCompatConfig,
     base_url: String,
     max_retries: u32,
@@ -80,9 +80,13 @@ impl OpenAiCompatClient {
     }
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
+        Self::new_with_api_key(Some(api_key.into()), config)
+    }
+
+    fn new_with_api_key(api_key: Option<String>, config: OpenAiCompatConfig) -> Self {
         Self {
             http: reqwest::Client::new(),
-            api_key: api_key.into(),
+            api_key,
             config,
             base_url: read_base_url(config),
             max_retries: DEFAULT_MAX_RETRIES,
@@ -92,13 +96,14 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
+        let api_key = read_env_non_empty(config.api_key_env)?;
+        if api_key.is_none() && !allows_missing_api_key(config) {
             return Err(ApiError::missing_credentials(
                 config.provider_name,
                 config.credential_env_vars(),
             ));
-        };
-        Ok(Self::new(api_key, config))
+        }
+        Ok(Self::new_with_api_key(api_key, config))
     }
 
     #[must_use]
@@ -193,14 +198,15 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = chat_completions_endpoint(&self.base_url);
-        self.http
+        let mut builder = self
+            .http
             .post(&request_url)
             .header("content-type", "application/json")
-            .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
-            .send()
-            .await
-            .map_err(ApiError::from)
+            .json(&build_chat_completion_request(request, self.config()));
+        if let Some(api_key) = &self.api_key {
+            builder = builder.bearer_auth(api_key);
+        }
+        builder.send().await.map_err(ApiError::from)
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
@@ -879,8 +885,20 @@ pub fn has_api_key(key: &str) -> bool {
 }
 
 #[must_use]
+pub fn has_base_url_override(config: OpenAiCompatConfig) -> bool {
+    read_env_non_empty(config.base_url_env)
+        .ok()
+        .flatten()
+        .is_some_and(|value| value != config.default_base_url)
+}
+
+#[must_use]
 pub fn read_base_url(config: OpenAiCompatConfig) -> String {
     std::env::var(config.base_url_env).unwrap_or_else(|_| config.default_base_url.to_string())
+}
+
+fn allows_missing_api_key(config: OpenAiCompatConfig) -> bool {
+    matches!(config.provider_name, "OpenAI") && has_base_url_override(config)
 }
 
 fn chat_completions_endpoint(base_url: &str) -> String {
@@ -1072,6 +1090,37 @@ mod tests {
             error,
             ApiError::MissingCredentials {
                 provider: "xAI",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn given_openai_base_url_override_when_api_key_missing_then_client_allows_anonymous_access() {
+        let _lock = env_lock();
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1");
+
+        let client = OpenAiCompatClient::from_env(OpenAiCompatConfig::openai())
+            .expect("base URL override should allow anonymous OpenAI-compatible access");
+
+        assert_eq!(client.base_url, "http://127.0.0.1:11434/v1");
+        std::env::remove_var("OPENAI_BASE_URL");
+    }
+
+    #[test]
+    fn given_default_openai_endpoint_when_api_key_missing_then_client_still_errors() {
+        let _lock = env_lock();
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("OPENAI_BASE_URL");
+
+        let error = OpenAiCompatClient::from_env(OpenAiCompatConfig::openai())
+            .expect_err("official OpenAI endpoint should still require credentials");
+
+        assert!(matches!(
+            error,
+            ApiError::MissingCredentials {
+                provider: "OpenAI",
                 ..
             }
         ));

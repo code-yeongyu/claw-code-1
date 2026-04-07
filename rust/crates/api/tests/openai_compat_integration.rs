@@ -134,6 +134,55 @@ async fn send_message_accepts_full_chat_completions_endpoint_override() {
     assert_eq!(request.path, "/chat/completions");
 }
 
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn given_openai_compat_base_url_without_api_key_when_send_message_then_request_omits_auth_header(
+) {
+    let _lock = env_lock();
+    let _openai_api_key = ScopedEnvVar::set_optional("OPENAI_API_KEY", None);
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_local\",",
+        "\"model\":\"qwen2.5-coder\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"Local endpoint works\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+    let _openai_base_url =
+        ScopedEnvVar::set_optional("OPENAI_BASE_URL", Some(server.base_url().as_str()));
+
+    let client = ProviderClient::from_model("qwen2.5-coder")
+        .expect("base URL override should construct an OpenAI-compatible provider");
+    assert!(matches!(client, ProviderClient::OpenAi(_)));
+
+    let response = client
+        .send_message(&MessageRequest {
+            model: "qwen2.5-coder".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("request should succeed against anonymous OpenAI-compatible endpoint");
+
+    assert_eq!(response.total_tokens(), 11);
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    assert_eq!(request.path, "/chat/completions");
+    assert!(!request.headers.contains_key("authorization"));
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["tools"][0]["type"], json!("function"));
+    assert_eq!(body["tool_choice"], json!("auto"));
+}
+
 #[tokio::test]
 async fn stream_message_normalizes_text_and_multiple_tool_calls() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
@@ -515,6 +564,15 @@ impl ScopedEnvVar {
     fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let previous = std::env::var_os(key);
         std::env::set_var(key, value);
+        Self { key, previous }
+    }
+
+    fn set_optional(key: &'static str, value: Option<&str>) -> Self {
+        let previous = std::env::var_os(key);
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
         Self { key, previous }
     }
 }

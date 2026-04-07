@@ -14,7 +14,7 @@ use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
     check_freshness, current_branch_cwd, dedupe_superseded_commit_events, edit_file, execute_bash,
-    glob_search, grep_search, load_system_prompt, ConfigLoader,
+    glob_search, grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -22,13 +22,12 @@ use runtime::{
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
-    TrustConfig,
     worker_boot::{WorkerReadySnapshot, WorkerRegistry},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
-    BranchFreshness, ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput,
-    LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneFailureClass, McpDegradedReport,
-    MessageRole, PermissionMode, PermissionPolicy, PromptCacheEvent, RuntimeError, Session,
-    TaskPacket, ToolError, ToolExecutor,
+    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
+    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneFailureClass,
+    McpDegradedReport, MessageRole, PermissionMode, PermissionPolicy, PromptCacheEvent,
+    RuntimeError, Session, TaskPacket, ToolError, ToolExecutor, TrustConfig,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1453,7 +1452,10 @@ fn run_worker_create(input: WorkerCreateInput) -> Result<String, String> {
     to_pretty_json(worker)
 }
 
-fn worker_trust_config_for(cwd: &str, trusted_roots_override: &[String]) -> Result<TrustConfig, String> {
+fn worker_trust_config_for(
+    cwd: &str,
+    trusted_roots_override: &[String],
+) -> Result<TrustConfig, String> {
     let runtime_config = ConfigLoader::default_for(cwd)
         .load()
         .map_err(|error| format!("failed to load runtime trust config: {error}"))?;
@@ -5623,8 +5625,16 @@ mod tests {
                 "denylist": ["{}"]
               }}
             }}"#,
-                Path::new("..").join("..").join("cwd").join("repo").display(),
-                Path::new("..").join("..").join("cwd").join("blocked").display()
+                Path::new("..")
+                    .join("..")
+                    .join("cwd")
+                    .join("repo")
+                    .display(),
+                Path::new("..")
+                    .join("..")
+                    .join("cwd")
+                    .join("blocked")
+                    .display()
             ),
         )
         .expect("write trust settings");
@@ -5658,9 +5668,11 @@ mod tests {
         .expect("WorkerCreate should still honor trusted_roots override");
 
         // then
-        let allowlisted_output: serde_json::Value = serde_json::from_str(&allowlisted).expect("json");
+        let allowlisted_output: serde_json::Value =
+            serde_json::from_str(&allowlisted).expect("json");
         let denylisted_output: serde_json::Value = serde_json::from_str(&denylisted).expect("json");
-        let override_output: serde_json::Value = serde_json::from_str(&override_only).expect("json");
+        let override_output: serde_json::Value =
+            serde_json::from_str(&override_only).expect("json");
         assert_eq!(allowlisted_output["trust_policy"], "auto_trust");
         assert_eq!(allowlisted_output["trust_auto_resolve"], true);
         assert_eq!(denylisted_output["trust_policy"], "deny");

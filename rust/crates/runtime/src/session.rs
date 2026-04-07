@@ -627,12 +627,7 @@ impl ConversationMessage {
         );
         object.insert(
             "blocks".to_string(),
-            JsonValue::Array(
-                self.blocks
-                    .iter()
-                    .map(ContentBlock::to_json)
-                    .collect(),
-            ),
+            JsonValue::Array(self.blocks.iter().map(ContentBlock::to_json).collect()),
         );
         if let Some(usage) = self.usage {
             object.insert("usage".to_string(), usage_to_json(usage));

@@ -177,6 +177,9 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if let Some(metadata) = metadata_for_model(model) {
         return metadata.provider;
     }
+    if openai_compat::has_base_url_override(openai_compat::OpenAiCompatConfig::openai()) {
+        return ProviderKind::OpenAi;
+    }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
         return ProviderKind::Anthropic;
     }
