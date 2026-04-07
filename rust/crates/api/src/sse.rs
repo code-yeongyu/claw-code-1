@@ -276,4 +276,28 @@ mod tests {
             ))
         );
     }
+
+    #[test]
+    fn given_message_delta_frame_with_empty_usage_when_parsed_then_usage_defaults_to_zero() {
+        // given
+        let frame = concat!(
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{}}\n\n"
+        );
+
+        // when
+        let event = parse_frame(frame).expect("frame should parse");
+
+        // then
+        assert_eq!(
+            event,
+            Some(StreamEvent::MessageDelta(crate::types::MessageDeltaEvent {
+                delta: MessageDelta {
+                    stop_reason: Some("end_turn".to_string()),
+                    stop_sequence: None,
+                },
+                usage: Usage::default(),
+            }))
+        );
+    }
 }

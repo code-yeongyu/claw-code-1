@@ -274,6 +274,44 @@ async fn send_message_parses_prompt_cache_token_usage_from_response() {
 }
 
 #[tokio::test]
+async fn given_empty_usage_object_when_send_message_parses_response_then_usage_defaults_to_zero() {
+    // given
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"msg_empty_usage\",",
+        "\"type\":\"message\",",
+        "\"role\":\"assistant\",",
+        "\"content\":[{\"type\":\"text\",\"text\":\"Hello from Claude\"}],",
+        "\"model\":\"claude-3-7-sonnet-latest\",",
+        "\"stop_reason\":\"end_turn\",",
+        "\"stop_sequence\":null,",
+        "\"usage\":{}",
+        "}"
+    );
+    let server = spawn_server(
+        state,
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+    let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
+
+    // when
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("response with empty usage object should still parse");
+
+    // then
+    assert_eq!(response.id, "msg_empty_usage");
+    assert_eq!(response.total_tokens(), 0);
+    assert_eq!(response.usage.input_tokens, 0);
+    assert_eq!(response.usage.cache_creation_input_tokens, 0);
+    assert_eq!(response.usage.cache_read_input_tokens, 0);
+    assert_eq!(response.usage.output_tokens, 0);
+}
+
+#[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn stream_message_parses_sse_events_with_tool_use() {
     let _guard = env_lock();
