@@ -43,7 +43,26 @@ The canonical implementation lives in [`rust/`](./rust), and the current source 
 - **`PHILOSOPHY.md`** — project intent and system-design framing
 - **`src/` + `tests/`** — companion Python/reference workspace and audit helpers; not the primary runtime surface
 
-## Quick start
+## Install
+
+Install `claw` globally with Cargo from the repo root:
+
+```bash
+cargo install --path rust/crates/rusty-claude-cli
+claw --help
+```
+
+That installs the binary into `~/.cargo/bin` by default. If `claw` is not on your `PATH` yet, add `~/.cargo/bin` first.
+
+If you prefer a repo-local installer, use the provided script:
+
+```bash
+./install.sh              # installs to ~/.cargo/bin/claw
+./install.sh --system     # installs to /usr/local/bin/claw
+claw --help
+```
+
+## Quick start from source
 
 ```bash
 cd rust

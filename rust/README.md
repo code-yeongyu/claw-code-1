@@ -4,6 +4,24 @@ A high-performance Rust rewrite of the Claw Code CLI agent harness. Built for sp
 
 For a task-oriented guide with copy/paste examples, see [`../USAGE.md`](../USAGE.md).
 
+## Install
+
+From the repository root, install `claw` globally with Cargo:
+
+```bash
+cargo install --path rust/crates/rusty-claude-cli
+claw --help
+```
+
+That installs into `~/.cargo/bin` by default.
+
+If you want a release build copied into a specific bin directory instead, use the repo installer:
+
+```bash
+./install.sh              # installs to ~/.cargo/bin/claw
+./install.sh --system     # installs to /usr/local/bin/claw
+```
+
 ## Quick Start
 
 ```bash

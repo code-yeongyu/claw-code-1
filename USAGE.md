@@ -24,7 +24,25 @@ cargo build --workspace
   - `claw login` for OAuth-based auth
 - Optional: `ANTHROPIC_BASE_URL` when targeting a proxy or local service
 
-## Install / build the workspace
+## Install globally
+
+Preferred Cargo install flow from the repository root:
+
+```bash
+cargo install --path rust/crates/rusty-claude-cli
+claw --help
+```
+
+Cargo installs into `~/.cargo/bin` by default.
+
+If you want the repository to build and copy the release binary for you:
+
+```bash
+./install.sh              # installs to ~/.cargo/bin/claw
+./install.sh --system     # installs to /usr/local/bin/claw
+```
+
+## Build the workspace locally
 
 ```bash
 cd rust
