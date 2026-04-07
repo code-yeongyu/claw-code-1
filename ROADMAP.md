@@ -489,3 +489,14 @@ to:
   2. Worktrees without active sessions should show `phase: pending` (created but no session started)
   3. Alternatively, `claw new` should write a lightweight marker file that `claw lanes` can discover
 **Acceptance:** `claw new foo && claw lanes` shows the new lane with `phase: pending`.
+
+## #39 — Session "completed" does not distinguish committed vs uncommitted work
+**Status:** Backlog
+**Pinpoint:** A coding session can report `session.completed` with 5/5 todos done and all tests passing, yet leave all file changes uncommitted in the worktree. The orchestrating claw (or human) receives a clean completion event but has no signal that `git status` is dirty. This forces manual post-session triage: check git status, verify changes, commit on behalf of the session. With multiple parallel sessions this becomes a real data-loss vector — uncommitted work can be wiped by worktree cleanup or branch switching.
+**Observed:** 2026-04-07, provider-registry session (`ses_29a88b279ffeUJfpsuEQlpbViZ`) completed 5/5 todos, `cargo test` green, LSP clean, but all 7 changed files were uncommitted. Orchestrator had to manually `git add -A && git commit`.
+**Action:**
+  1. Session completion event should include `git_dirty: bool` and `uncommitted_files: number` fields
+  2. When `commit_policy` is `Required` (from task packet), the session should auto-commit before reporting completion
+  3. `claw lanes` and `claw status` should surface dirty-worktree state as a warning
+  4. Alternatively: add a `post_completion_hook` that runs `git status --porcelain` and blocks the `completed` transition if dirty
+**Acceptance:** A session with `commit_policy: Required` either commits before completing, or transitions to `blocked` with `uncommitted_changes` as the blocker class instead of reporting clean completion.
