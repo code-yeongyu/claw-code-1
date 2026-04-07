@@ -144,6 +144,7 @@ impl SystemPromptBuilder {
             sections.push(format!("# Output Style: {name}\n{prompt}"));
         }
         sections.push(get_simple_system_section());
+        sections.push(get_tool_calling_section());
         sections.push(get_simple_doing_tasks_section());
         sections.push(get_actions_section());
         sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
@@ -489,6 +490,20 @@ fn get_simple_doing_tasks_section() -> String {
         .join("\n")
 }
 
+fn get_tool_calling_section() -> String {
+    let items = prepend_bullets(vec![
+        "When you need to inspect files, edit files, run commands, or fetch external data, use the provided native tool or function calling interface instead of describing the action in plain text.".to_string(),
+        "Do not emit tool requests as JSON, markdown, XML, or pseudo-tool blocks in assistant text. Use actual structured tool calls only.".to_string(),
+        "Never claim that you created a file, edited code, or ran a command unless the corresponding tool call succeeded and you received its result.".to_string(),
+        "Tool arguments must match the supplied schema exactly.".to_string(),
+    ]);
+
+    std::iter::once("# Tool calling".to_string())
+        .chain(items)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn get_actions_section() -> String {
     [
         "# Executing actions with care".to_string(),
@@ -755,6 +770,7 @@ mod tests {
             .render();
 
         assert!(prompt.contains("# System"));
+        assert!(prompt.contains("# Tool calling"));
         assert!(prompt.contains("# Project context"));
         assert!(prompt.contains("# Claude instructions"));
         assert!(prompt.contains("Project rules"));
@@ -804,5 +820,15 @@ mod tests {
         assert!(rendered.contains("# Claude instructions"));
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
+    }
+
+    #[test]
+    fn given_system_prompt_when_rendered_then_it_requires_native_tool_calls() {
+        let prompt = SystemPromptBuilder::new().render();
+
+        assert!(prompt.contains("# Tool calling"));
+        assert!(prompt.contains("Do not emit tool requests as JSON"));
+        assert!(prompt.contains("Use actual structured tool calls only"));
+        assert!(prompt.contains("Never claim that you created a file"));
     }
 }

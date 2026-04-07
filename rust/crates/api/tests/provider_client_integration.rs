@@ -53,6 +53,21 @@ fn read_xai_base_url_prefers_env_override() {
     assert_eq!(read_xai_base_url(), "https://example.xai.test/v1");
 }
 
+#[test]
+fn given_openai_base_url_override_when_model_is_unknown_then_provider_client_uses_openai_compat() {
+    let _lock = env_lock();
+    let _openai_api_key = EnvVarGuard::set("OPENAI_API_KEY", None);
+    let _openai_base_url = EnvVarGuard::set("OPENAI_BASE_URL", Some("http://127.0.0.1:11434/v1"));
+    let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+    let _anthropic_auth_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+
+    let client = ProviderClient::from_model("qwen2.5-coder").expect(
+        "explicit OpenAI-compatible base URL should route unknown models through OpenAI compat",
+    );
+
+    assert_eq!(client.provider_kind(), ProviderKind::OpenAi);
+}
+
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
