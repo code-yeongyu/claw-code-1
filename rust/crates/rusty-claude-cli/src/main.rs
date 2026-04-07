@@ -25,10 +25,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
     model_token_limit, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
-    AuthSource,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
+    MessageResponse, OutputContentBlock, PromptCache, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -44,16 +43,16 @@ use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     check_freshness, clear_oauth_credentials, current_branch_cwd, derive_actionable_summary,
-    format_usd, generate_pkce_pair, generate_state, load_oauth_credentials,
-    lane_spawn_request_from_packet, load_system_prompt, parse_oauth_callback_request_target,
+    format_usd, generate_pkce_pair, generate_state, lane_spawn_request_from_packet,
+    load_oauth_credentials, load_system_prompt, parse_oauth_callback_request_target,
     pricing_for_model, resolve_main_ref_cwd, resolve_sandbox_status, save_oauth_credentials,
     spawn_lane_from_packet, task_registry::TaskRegistry, validate_packet, ActionableSummary,
     ApiClient, ApiRequest, AssistantEvent, BranchFreshness, CompactionConfig, ConfigLoader,
     ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, LaneSpawnTransport,
-    McpServerManager, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
-    OAuthConfig, OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext,
-    PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TaskPacket, TokenUsage,
-    ToolError, ToolExecutor, UsageTracker, Worker,
+    McpServerManager, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig,
+    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
+    ResolvedPermissionMode, RuntimeError, Session, TaskPacket, TokenUsage, ToolError, ToolExecutor,
+    UsageTracker, Worker,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -170,7 +169,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Lanes { output_format } => run_lanes(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
-        CliAction::New { branch, output_format } => run_new_lane(&branch, output_format)?,
+        CliAction::New {
+            branch,
+            output_format,
+        } => run_new_lane(&branch, output_format)?,
         CliAction::Task { action } => run_task_command(action)?,
         CliAction::Repl {
             model,
@@ -501,7 +503,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             if branch.trim().is_empty() {
                 return Err("new subcommand requires a branch name".to_string());
             }
-            Ok(CliAction::New { branch, output_format })
+            Ok(CliAction::New {
+                branch,
+                output_format,
+            })
         }
         "prompt" => {
             let prompt = rest[1..].join(" ");
@@ -1494,9 +1499,7 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
         format!("Missing commits  {}", context.missing_commits_count),
     ];
     if context.stale_against_main {
-        details.push(
-            "Suggested action merge or rebase main before workspace tests".to_string(),
-        );
+        details.push("Suggested action merge or rebase main before workspace tests".to_string());
     }
     DiagnosticCheck::new("Workspace", level, summary)
         .with_details(details)
@@ -1607,11 +1610,9 @@ fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
 
 fn check_lanes_health() -> DiagnosticCheck {
     match load_live_lanes() {
-        Ok(lanes) if lanes.is_empty() => DiagnosticCheck::new(
-            "Lanes",
-            DiagnosticLevel::Ok,
-            "no active opencode sessions",
-        ),
+        Ok(lanes) if lanes.is_empty() => {
+            DiagnosticCheck::new("Lanes", DiagnosticLevel::Ok, "no active opencode sessions")
+        }
         Ok(lanes) => {
             let stalled: Vec<_> = lanes.iter().filter(|l| l.phase == "stalled").collect();
             let total = lanes.len();
@@ -1639,14 +1640,13 @@ fn check_lanes_health() -> DiagnosticCheck {
                 .with_data(Map::from_iter([
                     ("total_sessions".to_string(), json!(total)),
                     ("stalled_sessions".to_string(), json!(stalled.len())),
-                    ("stalled_ids".to_string(), json!(stalled.iter().map(|l| &l.session_id).collect::<Vec<_>>())),
+                    (
+                        "stalled_ids".to_string(),
+                        json!(stalled.iter().map(|l| &l.session_id).collect::<Vec<_>>()),
+                    ),
                 ]))
         }
-        Err(_) => DiagnosticCheck::new(
-            "Lanes",
-            DiagnosticLevel::Ok,
-            "could not read session data",
-        ),
+        Err(_) => DiagnosticCheck::new("Lanes", DiagnosticLevel::Ok, "could not read session data"),
     }
 }
 
@@ -1769,6 +1769,12 @@ fn default_oauth_config() -> OAuthConfig {
 }
 
 fn run_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("OPENAI_BASE_URL")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(io::Error::other(api::oauth_unsupported_for_openai_base_url_message()).into());
+    }
     let cwd = env::current_dir()?;
     let config = ConfigLoader::default_for(&cwd).load()?;
     let default_oauth = default_oauth_config();
@@ -2325,11 +2331,7 @@ fn context_pressure_notice(summary: &runtime::TurnSummary) -> Option<String> {
             return None;
         }
 
-        let utilization_pct = event
-            .data
-            .as_ref()?
-            .get("utilization_pct")?
-            .as_u64()?;
+        let utilization_pct = event.data.as_ref()?.get("utilization_pct")?.as_u64()?;
         Some(format_context_pressure_notice(
             utilization_pct.min(u64::from(u8::MAX)) as u8,
         ))
@@ -4561,9 +4563,7 @@ fn compute_stale_branch_fields(git_branch: Option<&str>) -> (bool, usize) {
     };
     match check_freshness(&branch, &main_ref) {
         BranchFreshness::Fresh => (false, 0),
-        BranchFreshness::Stale {
-            commits_behind, ..
-        } => (true, commits_behind),
+        BranchFreshness::Stale { commits_behind, .. } => (true, commits_behind),
         BranchFreshness::Diverged { behind, .. } => (true, behind),
     }
 }
@@ -4649,8 +4649,6 @@ fn is_worker_snapshot_tool(tool_name: &str) -> bool {
             | "WorkerTerminate"
     )
 }
-
-
 
 fn format_status_report(
     model: &str,
@@ -4922,7 +4920,11 @@ fn load_opencode_jsonl_lanes(
     }
 
     let mut session_paths = Vec::new();
-    collect_files_with_extension(&sessions_root, PRIMARY_SESSION_EXTENSION, &mut session_paths)?;
+    collect_files_with_extension(
+        &sessions_root,
+        PRIMARY_SESSION_EXTENSION,
+        &mut session_paths,
+    )?;
 
     let mut lanes = Vec::new();
     for session_path in session_paths {
@@ -5033,7 +5035,11 @@ fn parse_opencode_jsonl_lane(
     let worktree_path = session_meta
         .as_ref()
         .and_then(extract_worktree_path_from_value)
-        .or_else(|| last_message.as_ref().and_then(extract_worktree_path_from_value))
+        .or_else(|| {
+            last_message
+                .as_ref()
+                .and_then(extract_worktree_path_from_value)
+        })
         .unwrap_or_else(|| repo.clone());
     let last_event_ms = last_message
         .as_ref()
@@ -5044,7 +5050,12 @@ fn parse_opencode_jsonl_lane(
         .as_ref()
         .and_then(|value| value.get("title").and_then(Value::as_str));
     let activity = last_message.as_ref().and_then(extract_lane_activity_hint);
-    let phase = classify_lane_phase(blocker.as_deref(), title, activity.as_deref(), last_event_ms);
+    let phase = classify_lane_phase(
+        blocker.as_deref(),
+        title,
+        activity.as_deref(),
+        last_event_ms,
+    );
 
     Ok(Some(LaneRecord {
         session_id,
@@ -5101,7 +5112,12 @@ fn parse_opencode_storage_lane(
     Ok(Some(LaneRecord {
         session_id,
         branch: resolve_lane_branch(&worktree_path),
-        phase: classify_lane_phase(blocker.as_deref(), title, activity.as_deref(), last_event_ms),
+        phase: classify_lane_phase(
+            blocker.as_deref(),
+            title,
+            activity.as_deref(),
+            last_event_ms,
+        ),
         repo,
         worktree_path,
         last_event_ms,
@@ -5406,7 +5422,9 @@ fn run_new_lane(
 
     let cwd = std::env::current_dir()?;
     let safe_dir_name = branch.replace('/', "-");
-    let worktree_path = cwd.join("..").join(format!("claw-worktree-{safe_dir_name}"));
+    let worktree_path = cwd
+        .join("..")
+        .join(format!("claw-worktree-{safe_dir_name}"));
     let worktree_path = worktree_path.canonicalize().unwrap_or(worktree_path);
 
     // Pre-flight: check if branch already exists
@@ -5439,14 +5457,22 @@ fn run_new_lane(
         if worktree_path.exists() {
             eprintln!("Removing stale worktree at {}", worktree_path.display());
             let _ = Command::new("git")
-                .args(["worktree", "remove", "--force", &worktree_path.to_string_lossy()])
+                .args([
+                    "worktree",
+                    "remove",
+                    "--force",
+                    &worktree_path.to_string_lossy(),
+                ])
                 .current_dir(&cwd)
                 .output();
         }
     }
 
     // Create worktree with 30s timeout
-    eprintln!("Creating worktree for branch '{branch}' at {}", worktree_path.display());
+    eprintln!(
+        "Creating worktree for branch '{branch}' at {}",
+        worktree_path.display()
+    );
     let worktree_str = worktree_path.to_string_lossy().into_owned();
     let worktree_args: Vec<&str> = if branch_exists {
         vec!["worktree", "add", &worktree_str, branch]
@@ -5481,11 +5507,7 @@ fn run_new_lane(
         }
     }
 
-    let msg = format!(
-        "Lane '{}' created at {}",
-        branch,
-        worktree_path.display()
-    );
+    let msg = format!("Lane '{}' created at {}", branch, worktree_path.display());
     match output_format {
         CliOutputFormat::Json => println!(
             "{}",
@@ -5536,12 +5558,9 @@ fn run_task_create_command(
     let packet = read_task_packet_source(source)?;
     let task = cli_task_registry().create_from_packet(packet.clone())?;
     let transport = resolve_task_create_transport_mode(&cwd);
-    let lane_spawn = spawn_lane_from_packet(
-        &packet,
-        &cwd,
-        transport,
-        &mut |message| eprintln!("{message}"),
-    )?;
+    let lane_spawn = spawn_lane_from_packet(&packet, &cwd, transport, &mut |message| {
+        eprintln!("{message}")
+    })?;
     let message = format!("created {} from {}", task.task_id, source_label(source));
 
     match output_format {
@@ -7060,9 +7079,15 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
             context_window_tokens,
         } => {
             lines.push(format!("  Model            {model}"));
-            lines.push(format!("  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"));
-            lines.push(format!("  Requested output {requested_output_tokens} tokens"));
-            lines.push(format!("  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"));
+            lines.push(format!(
+                "  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"
+            ));
+            lines.push(format!(
+                "  Requested output {requested_output_tokens} tokens"
+            ));
+            lines.push(format!(
+                "  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"
+            ));
             lines.push(format!("  Context window   {context_window_tokens} tokens"));
         }
         api::ApiError::Api { message, body, .. } => {
@@ -8140,35 +8165,35 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        create_managed_session_handle, describe_tool_progress, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_compact_report, format_cost_report, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, format_user_visible_api_error,
-        lanes_json_value, load_live_lanes, normalize_permission_mode, parse_args,
-        parse_git_status_branch,
+        check_workspace_health, classify_lane_phase, create_managed_session_handle,
+        describe_tool_progress, filter_tool_specs, format_bughunter_report,
+        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
+        format_cost_report, format_internal_prompt_progress_line, format_issue_report,
+        format_model_report, format_model_switch_report, format_permissions_report,
+        format_permissions_switch_report, format_pr_report, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
+        format_unknown_slash_command, format_unknown_slash_command_message,
+        format_user_visible_api_error, lanes_json_value, load_live_lanes,
+        normalize_permission_mode, parse_args, parse_git_status_branch,
         parse_git_status_metadata_for, parse_git_workspace_summary, permission_policy,
         print_help_to, push_output_block, render_config_report, render_diff_report,
         render_diff_report_for, render_lanes_report, render_memory_report, render_repl_help,
         render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
-        classify_lane_phase, check_workspace_health, status_json_value, LaneRecord,
-        STALL_THRESHOLD_MS,
-        slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        DiagnosticLevel, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
-        LocalHelpTopic, SlashCommand, StatusUsage, TaskCliAction, DEFAULT_MODEL,
+        slash_command_completion_candidates_with_sessions, status_context, status_json_value,
+        validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
+        DiagnosticLevel, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LaneRecord, LiveCli, LocalHelpTopic, SlashCommand,
+        StatusUsage, TaskCliAction, DEFAULT_MODEL, STALL_THRESHOLD_MS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
     use runtime::{
-        load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
-        ConversationMessage, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
+        clear_oauth_credentials, load_oauth_credentials, save_oauth_credentials, AssistantEvent,
+        ConfigLoader, ContentBlock, ConversationMessage, MessageRole, OAuthConfig, PermissionMode,
+        Session, ToolExecutor,
     };
     use serde_json::json;
     use std::fs;
@@ -8583,6 +8608,7 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("OPENAI_BASE_URL");
 
         save_oauth_credentials(&runtime::OAuthTokenSet {
             access_token: "expired-access-token".to_string(),
@@ -8625,6 +8651,66 @@ mod tests {
             stored.refresh_token.as_deref(),
             Some("refreshed-refresh-token")
         );
+    }
+
+    #[test]
+    fn resolve_cli_auth_source_rejects_saved_oauth_when_openai_base_url_is_set() {
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        let config_home = temp_dir();
+        std::fs::create_dir_all(&workspace).expect("workspace should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        let original_auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
+        let original_openai_base_url = std::env::var("OPENAI_BASE_URL").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::set_var("OPENAI_BASE_URL", "https://openai-compatible.example/v1");
+
+        save_oauth_credentials(&runtime::OAuthTokenSet {
+            access_token: "saved-access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            expires_at: Some(4102444800),
+            scopes: vec!["org:create_api_key".to_string(), "user:profile".to_string()],
+        })
+        .expect("save oauth credentials");
+
+        let error = super::resolve_cli_auth_source_for_cwd(&workspace, || {
+            panic!("default OAuth config should not load when OPENAI_BASE_URL is set")
+        })
+        .expect_err("saved OAuth should be rejected when OPENAI_BASE_URL is set");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("OPENAI_BASE_URL"), "{rendered}");
+        assert!(rendered.contains("API key auth"), "{rendered}");
+
+        let stored = load_oauth_credentials()
+            .expect("load stored credentials")
+            .expect("stored credentials should exist");
+        assert_eq!(stored.access_token, "saved-access-token");
+
+        clear_oauth_credentials().expect("clear credentials");
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_api_key {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        match original_auth_token {
+            Some(value) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", value),
+            None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
+        }
+        match original_openai_base_url {
+            Some(value) => std::env::set_var("OPENAI_BASE_URL", value),
+            None => std::env::remove_var("OPENAI_BASE_URL"),
+        }
+        std::fs::remove_dir_all(workspace).expect("temp workspace should clean up");
+        std::fs::remove_dir_all(config_home).expect("temp config home should clean up");
     }
 
     #[test]
@@ -8813,7 +8899,8 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_args(&["new".to_string(), "fix/my-branch".to_string()]).expect("new should parse"),
+            parse_args(&["new".to_string(), "fix/my-branch".to_string()])
+                .expect("new should parse"),
             CliAction::New {
                 branch: "fix/my-branch".to_string(),
                 output_format: CliOutputFormat::Text,
@@ -9054,10 +9141,7 @@ mod tests {
             .as_millis() as u64;
 
         // Recent activity -> not stalled
-        assert_ne!(
-            classify_lane_phase(None, None, None, now_ms),
-            "stalled",
-        );
+        assert_ne!(classify_lane_phase(None, None, None, now_ms), "stalled",);
         assert_ne!(
             classify_lane_phase(None, None, None, now_ms - 1_000),
             "stalled",
@@ -9065,10 +9149,7 @@ mod tests {
 
         // 10+ minutes idle -> stalled
         let stale_ms = now_ms - STALL_THRESHOLD_MS - 1;
-        assert_eq!(
-            classify_lane_phase(None, None, None, stale_ms),
-            "stalled",
-        );
+        assert_eq!(classify_lane_phase(None, None, None, stale_ms), "stalled",);
 
         // Blocked takes priority over stalled
         assert_eq!(
@@ -9077,10 +9158,7 @@ mod tests {
         );
 
         // Zero timestamp -> not stalled (guard for unknown)
-        assert_ne!(
-            classify_lane_phase(None, None, None, 0),
-            "stalled",
-        );
+        assert_ne!(classify_lane_phase(None, None, None, 0), "stalled",);
 
         // Activity keywords still work for recent sessions
         assert_eq!(
@@ -9903,13 +9981,19 @@ mod tests {
         let workers = super::StatusWorkersSnapshot::empty("none");
 
         // when
-        let json = super::status_json_value("test-model", super::StatusUsage {
-            message_count: 0,
-            turns: 0,
-            latest: runtime::TokenUsage::default(),
-            cumulative: runtime::TokenUsage::default(),
-            estimated_tokens: 0,
-        }, "danger-full-access", &context, &workers);
+        let json = super::status_json_value(
+            "test-model",
+            super::StatusUsage {
+                message_count: 0,
+                turns: 0,
+                latest: runtime::TokenUsage::default(),
+                cumulative: runtime::TokenUsage::default(),
+                estimated_tokens: 0,
+            },
+            "danger-full-access",
+            &context,
+            &workers,
+        );
 
         // then — workspace section contains typed stale fields
         assert_eq!(json["workspace"]["stale_against_main"], true);

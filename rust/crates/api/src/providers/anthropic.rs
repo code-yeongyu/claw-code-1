@@ -14,11 +14,14 @@ use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, Session
 use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
-use super::{preflight_message_request as estimate_preflight_message_request, Provider, ProviderFuture};
+use super::{
+    preflight_message_request as estimate_preflight_message_request, Provider, ProviderFuture,
+};
 use crate::sse::SseParser;
 use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+const OPENAI_BASE_URL_OAUTH_UNSUPPORTED_MESSAGE: &str = "OAuth authentication is only supported for Anthropic. OPENAI_BASE_URL is set, so saved OAuth credentials are disabled. Use API key auth for your OpenAI-compatible provider instead, or unset OPENAI_BASE_URL and run `claw login` again.";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
@@ -535,6 +538,11 @@ impl AuthSource {
         if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
             return Ok(Self::BearerToken(bearer_token));
         }
+        if openai_base_url_disables_oauth()? {
+            return Err(ApiError::Auth(
+                OPENAI_BASE_URL_OAUTH_UNSUPPORTED_MESSAGE.to_string(),
+            ));
+        }
         match load_saved_oauth_token() {
             Ok(Some(token_set)) if oauth_token_is_expired(&token_set) => {
                 if token_set.refresh_token.is_some() {
@@ -573,7 +581,7 @@ pub fn resolve_saved_oauth_token(config: &OAuthConfig) -> Result<Option<OAuthTok
 pub fn has_auth_from_env_or_saved() -> Result<bool, ApiError> {
     Ok(read_env_non_empty("ANTHROPIC_API_KEY")?.is_some()
         || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some()
-        || load_saved_oauth_token()?.is_some())
+        || (!openai_base_url_disables_oauth()? && load_saved_oauth_token()?.is_some()))
 }
 
 pub fn resolve_startup_auth_source<F>(load_oauth_config: F) -> Result<AuthSource, ApiError>
@@ -591,6 +599,11 @@ where
     }
     if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
         return Ok(AuthSource::BearerToken(bearer_token));
+    }
+    if openai_base_url_disables_oauth()? {
+        return Err(ApiError::Auth(
+            OPENAI_BASE_URL_OAUTH_UNSUPPORTED_MESSAGE.to_string(),
+        ));
     }
 
     let Some(token_set) = load_saved_oauth_token()? else {
@@ -686,6 +699,15 @@ fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
         Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(ApiError::from(error)),
     }
+}
+
+fn openai_base_url_disables_oauth() -> Result<bool, ApiError> {
+    Ok(read_env_non_empty("OPENAI_BASE_URL")?.is_some())
+}
+
+#[must_use]
+pub const fn oauth_unsupported_for_openai_base_url_message() -> &'static str {
+    OPENAI_BASE_URL_OAUTH_UNSUPPORTED_MESSAGE
 }
 
 #[cfg(test)]
@@ -1018,6 +1040,37 @@ mod tests {
     }
 
     #[test]
+    fn auth_source_from_env_or_saved_rejects_saved_oauth_when_openai_base_url_is_set() {
+        let _guard = env_lock();
+        let config_home = temp_config_home();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("OPENAI_BASE_URL", "https://openai-compatible.example/v1");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        save_oauth_credentials(&runtime::OAuthTokenSet {
+            access_token: "saved-access-token".to_string(),
+            refresh_token: Some("refresh".to_string()),
+            expires_at: Some(now_unix_timestamp() + 300),
+            scopes: vec!["scope:a".to_string()],
+        })
+        .expect("save oauth credentials");
+
+        let error = AuthSource::from_env_or_saved()
+            .expect_err("saved OAuth should be rejected when OPENAI_BASE_URL is set");
+
+        assert!(matches!(
+            error,
+            crate::error::ApiError::Auth(message)
+                if message.contains("OPENAI_BASE_URL") && message.contains("API key auth")
+        ));
+
+        clear_oauth_credentials().expect("clear credentials");
+        std::env::remove_var("OPENAI_BASE_URL");
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        cleanup_temp_config_home(&config_home);
+    }
+
+    #[test]
     fn oauth_token_expiry_uses_expires_at_timestamp() {
         assert!(oauth_token_is_expired(&OAuthTokenSet {
             access_token: "access-token".to_string(),
@@ -1117,6 +1170,44 @@ mod tests {
         assert_eq!(stored.refresh_token.as_deref(), Some("refresh-token"));
 
         clear_oauth_credentials().expect("clear credentials");
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        cleanup_temp_config_home(&config_home);
+    }
+
+    #[test]
+    fn resolve_startup_auth_source_rejects_saved_oauth_when_openai_base_url_is_set() {
+        let _guard = env_lock();
+        let config_home = temp_config_home();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("OPENAI_BASE_URL", "https://openai-compatible.example/v1");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        save_oauth_credentials(&runtime::OAuthTokenSet {
+            access_token: "saved-access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            expires_at: Some(now_unix_timestamp() + 300),
+            scopes: vec!["scope:a".to_string()],
+        })
+        .expect("save oauth credentials");
+
+        let error =
+            resolve_startup_auth_source(|| panic!("oauth config should not load when disabled"))
+                .expect_err("saved OAuth should be rejected when OPENAI_BASE_URL is set");
+
+        assert!(matches!(
+            error,
+            crate::error::ApiError::Auth(message)
+                if message.contains("OPENAI_BASE_URL") && message.contains("API key auth")
+        ));
+
+        let stored = runtime::load_oauth_credentials()
+            .expect("load stored credentials")
+            .expect("stored token set");
+        assert_eq!(stored.access_token, "saved-access-token");
+        assert_eq!(stored.refresh_token.as_deref(), Some("refresh-token"));
+
+        clear_oauth_credentials().expect("clear credentials");
+        std::env::remove_var("OPENAI_BASE_URL");
         std::env::remove_var("CLAW_CONFIG_HOME");
         cleanup_temp_config_home(&config_home);
     }
