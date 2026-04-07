@@ -8,6 +8,7 @@ use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
+pub mod bedrock;
 pub mod openai_compat;
 
 #[allow(dead_code)]
@@ -31,6 +32,7 @@ pub trait Provider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Anthropic,
+    Bedrock,
     Xai,
     OpenAi,
 }
@@ -138,6 +140,7 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "haiku" => "claude-haiku-4-5-20251213",
                     _ => trimmed,
                 },
+                ProviderKind::Bedrock => trimmed,
                 ProviderKind::Xai => match *alias {
                     "grok" | "grok-3" => "grok-3",
                     "grok-mini" | "grok-3-mini" => "grok-3-mini",
@@ -153,6 +156,14 @@ pub fn resolve_model_alias(model: &str) -> String {
 #[must_use]
 pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     let canonical = resolve_model_alias(model);
+    if is_bedrock_model_identifier(&canonical) {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::Bedrock,
+            auth_env: "AWS_ACCESS_KEY_ID",
+            base_url_env: "BEDROCK_BASE_URL",
+            default_base_url: bedrock::DEFAULT_BASE_URL_TEMPLATE,
+        });
+    }
     if canonical.starts_with("claude") {
         return Some(ProviderMetadata {
             provider: ProviderKind::Anthropic,
@@ -187,6 +198,10 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
         return ProviderKind::Xai;
     }
     ProviderKind::Anthropic
+}
+
+fn is_bedrock_model_identifier(model: &str) -> bool {
+    !model.starts_with("claude") && model.contains("anthropic.")
 }
 
 #[must_use]
@@ -285,6 +300,10 @@ mod tests {
         assert_eq!(
             detect_provider_kind("claude-sonnet-4-6"),
             ProviderKind::Anthropic
+        );
+        assert_eq!(
+            detect_provider_kind("us.anthropic.claude-sonnet-4-6"),
+            ProviderKind::Bedrock
         );
     }
 
