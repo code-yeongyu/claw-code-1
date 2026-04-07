@@ -526,3 +526,10 @@ to:
   3. Add `claw lanes --verify-disk` that checks each completed session's claimed file list against actual git diff
   4. Investigate whether opencode serve has a sandbox mode that intercepts file writes
 **Acceptance:** A session that reports file edits but has zero `git diff` output transitions to `blocked` with `phantom_edits` failure class instead of `completed`.
+
+### #41 investigation findings — current-worktree file roundtrip
+
+- Added regression test `runtime::file_ops::tests::resolves_relative_write_and_read_paths_from_current_worktree`.
+- The test sets a temp worktree as `current_dir`, writes `generated/current-worktree.txt` via relative `write_file`, immediately reads the same relative path via `read_file`, and asserts both returned absolute paths resolve inside that temp worktree with the expected content.
+- Finding: `runtime::file_ops::{write_file, read_file}` correctly honor the process CWD for relative paths, persist/read back the same on-disk file in-process, and return canonical absolute paths (for example `/private/var/...` instead of the `/var/...` symlink form on macOS temp dirs).
+- Implication: ROADMAP #41 is less likely to be a pure `file_ops` path-resolution bug. The stronger remaining suspects are opencode server/session routing: shared global session store, wrong serve-process CWD, or writes executing in a different worktree than the reporting session.

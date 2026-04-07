@@ -621,12 +621,37 @@ pub fn is_symlink_escape(path: &Path, workspace_root: &Path) -> io::Result<bool>
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         edit_file, glob_search, grep_search, is_symlink_escape, read_file, read_file_in_workspace,
         write_file, GrepSearchInput, MAX_WRITE_SIZE,
     };
+
+    struct CurrentDirGuard {
+        _env_guard: MutexGuard<'static, ()>,
+        previous_dir: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn change_to(path: &Path) -> Self {
+            let env_guard = crate::test_env_lock();
+            let previous_dir = std::env::current_dir().expect("cwd should resolve");
+            std::env::set_current_dir(path).expect("cwd should change");
+            Self {
+                _env_guard: env_guard,
+                previous_dir,
+            }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous_dir).expect("cwd should restore");
+        }
+    }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -646,6 +671,35 @@ mod tests {
         let read_output = read_file(path.to_string_lossy().as_ref(), Some(1), Some(1))
             .expect("read should succeed");
         assert_eq!(read_output.file.content, "two");
+    }
+
+    #[test]
+    fn resolves_relative_write_and_read_paths_from_current_worktree() {
+        // given
+        let worktree = temp_path("current-worktree");
+        std::fs::create_dir_all(&worktree).expect("worktree dir should be created");
+        let _cwd_guard = CurrentDirGuard::change_to(&worktree);
+        let relative_path = Path::new("generated").join("current-worktree.txt");
+        let relative_path = relative_path.to_string_lossy().into_owned();
+        let expected_path = worktree.join("generated").join("current-worktree.txt");
+        let expected_content = "known worktree content";
+
+        // when
+        let write_output =
+            write_file(&relative_path, expected_content).expect("write should succeed");
+        let read_output = read_file(&relative_path, None, None).expect("read should succeed");
+        let expected_path = expected_path
+            .canonicalize()
+            .expect("expected path should canonicalize after write");
+
+        // then
+        assert_eq!(write_output.file_path, expected_path.to_string_lossy());
+        assert_eq!(read_output.file.file_path, expected_path.to_string_lossy());
+        assert_eq!(read_output.file.content, expected_content);
+        assert_eq!(
+            std::fs::read_to_string(&expected_path).expect("disk file should exist"),
+            expected_content
+        );
     }
 
     #[test]
