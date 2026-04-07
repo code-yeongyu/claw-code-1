@@ -510,3 +510,19 @@ to:
   2. Alternatively: require each completed session to mark its ROADMAP item as `Done` with commit hash before reporting completion
   3. At batch-spawn time, pre-filter ROADMAP items against a quick `grep` for key function/test names to avoid assigning already-implemented work
 **Acceptance:** A 10-session batch does not assign any lane to a ROADMAP item whose acceptance criteria are already met in the current tree.
+
+## #41 — Phantom completions: sessions report edits that never reach disk
+**Status:** Backlog
+**Pinpoint:** In a 10-session parallel batch, 6 out of 10 sessions reported successful file edits, passing tests, and clean diagnostics, but left zero dirty files on disk. The sessions used `write_file` / `edit_file` tools and cited specific line numbers and function names, but `git status` showed the worktree was pristine. This is worse than #39 (uncommitted work) — this is work that the session believes happened but never persisted.
+**Observed:** 2026-04-07 batch 2. Sessions tool-local, config-env, merge-lanes, roadmap-audit, omc-render, doctor-ext all reported 4/4 or 5/5 completion with verification evidence, zero disk changes.
+**Possible causes:**
+  1. opencode serve `write_file` tool operates in a sandbox/memory layer that doesn't flush to the actual worktree
+  2. File edits succeed but are reverted by a checkpoint/undo mechanism before session completion
+  3. The model hallucinates tool call results without actually executing them (tool output fabrication)
+  4. Worktree path mismatch between opencode serve CWD and the git worktree root
+**Action:**
+  1. Add post-edit verification: after every `write_file`/`edit_file`, immediately `read_file` the target and compare — if content doesn't match, emit `edit_phantom` event
+  2. Session completion should run `git status --porcelain` and include the result in the completion event (partially addressed by #39)
+  3. Add `claw lanes --verify-disk` that checks each completed session's claimed file list against actual git diff
+  4. Investigate whether opencode serve has a sandbox mode that intercepts file writes
+**Acceptance:** A session that reports file edits but has zero `git diff` output transitions to `blocked` with `phantom_edits` failure class instead of `completed`.
