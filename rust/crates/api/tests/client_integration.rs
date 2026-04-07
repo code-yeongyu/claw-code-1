@@ -24,6 +24,7 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 
 #[tokio::test]
 async fn send_message_posts_json_and_parses_response() {
+    // given
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let body = concat!(
         "{",
@@ -47,11 +48,14 @@ async fn send_message_posts_json_and_parses_response() {
     let client = ApiClient::new("test-key")
         .with_auth_token(Some("proxy-token".to_string()))
         .with_base_url(server.base_url());
+
+    // when
     let response = client
         .send_message(&sample_request(false))
         .await
         .expect("request should succeed");
 
+    // then
     assert_eq!(response.id, "msg_test");
     assert_eq!(response.total_tokens(), 16);
     assert_eq!(response.request_id.as_deref(), Some("req_body_123"));
@@ -97,10 +101,7 @@ async fn send_message_posts_json_and_parses_response() {
     assert!(body.get("stream").is_none());
     assert_eq!(body["tools"][0]["name"], json!("get_weather"));
     assert_eq!(body["tool_choice"]["type"], json!("auto"));
-    assert_eq!(
-        body["betas"],
-        json!(["claude-code-20250219", "prompt-caching-scope-2026-01-05"])
-    );
+    assert!(body.get("betas").is_none());
 }
 
 #[tokio::test]
@@ -140,6 +141,7 @@ async fn send_message_blocks_oversized_requests_before_the_http_call() {
 
 #[tokio::test]
 async fn send_message_applies_request_profile_and_records_telemetry() {
+    // given
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let server = spawn_server(
         state.clone(),
@@ -171,11 +173,13 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
         .with_extra_body_param("metadata", json!({"source": "clawd-code"}))
         .with_session_tracer(SessionTracer::new("session-telemetry", sink.clone()));
 
+    // when
     let response = client
         .send_message(&sample_request(false))
         .await
         .expect("request should succeed");
 
+    // then
     assert_eq!(response.request_id.as_deref(), Some("req_profile_123"));
 
     let captured = state.lock().await;
@@ -191,14 +195,7 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be json");
     assert_eq!(body["metadata"]["source"], json!("clawd-code"));
-    assert_eq!(
-        body["betas"],
-        json!([
-            "claude-code-20250219",
-            "prompt-caching-scope-2026-01-05",
-            "tools-2026-04-01"
-        ])
-    );
+    assert!(body.get("betas").is_none());
 
     let events = sink.events();
     assert_eq!(events.len(), 6);

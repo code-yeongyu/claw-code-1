@@ -14,7 +14,9 @@ use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, Session
 use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
-use super::{preflight_message_request as estimate_preflight_message_request, Provider, ProviderFuture};
+use super::{
+    preflight_message_request as estimate_preflight_message_request, Provider, ProviderFuture,
+};
 use crate::sse::SseParser;
 use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
 
@@ -466,7 +468,9 @@ impl AnthropicClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let request_body = self.request_profile.render_json_body(request)?;
+        let request_body = self
+            .request_profile
+            .render_json_body_with_betas(request, should_include_betas_in_body(&request_url))?;
         let request_builder = self.build_request(&request_url).json(&request_body);
         request_builder.send().await.map_err(ApiError::from)
     }
@@ -720,6 +724,17 @@ fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Strin
         .map(ToOwned::to_owned)
 }
 
+fn should_include_betas_in_body(request_url: &str) -> bool {
+    reqwest::Url::parse(request_url)
+        .ok()
+        .and_then(|url| url.host_str().map(is_anthropic_host))
+        .unwrap_or(false)
+}
+
+fn is_anthropic_host(host: &str) -> bool {
+    host == "anthropic.com" || host.ends_with(".anthropic.com")
+}
+
 impl Provider for AnthropicClient {
     type Stream = MessageStream;
 
@@ -862,8 +877,9 @@ mod tests {
     use runtime::{clear_oauth_credentials, save_oauth_credentials, OAuthConfig};
 
     use super::{
-        now_unix_timestamp, oauth_token_is_expired, resolve_saved_oauth_token,
-        resolve_startup_auth_source, AnthropicClient, AuthSource, OAuthTokenSet,
+        is_anthropic_host, now_unix_timestamp, oauth_token_is_expired, resolve_saved_oauth_token,
+        resolve_startup_auth_source, should_include_betas_in_body, AnthropicClient, AuthSource,
+        OAuthTokenSet,
     };
     use crate::types::{ContentBlockDelta, MessageRequest};
 
@@ -1236,15 +1252,20 @@ mod tests {
 
     #[test]
     fn auth_source_applies_headers() {
+        // given
         let auth = AuthSource::ApiKeyAndBearer {
             api_key: "test-key".to_string(),
             bearer_token: "proxy-token".to_string(),
         };
+
+        // when
         let request = auth
             .apply(reqwest::Client::new().post("https://example.test"))
             .build()
             .expect("request build");
         let headers = request.headers();
+
+        // then
         assert_eq!(
             headers.get("x-api-key").and_then(|v| v.to_str().ok()),
             Some("test-key")
@@ -1253,5 +1274,39 @@ mod tests {
             headers.get("authorization").and_then(|v| v.to_str().ok()),
             Some("Bearer proxy-token")
         );
+    }
+
+    #[test]
+    fn anthropic_hosts_are_detected_for_body_betas() {
+        // given
+        let anthropic_host = "api.anthropic.com";
+        let request_url = "https://api.anthropic.com/v1/messages";
+
+        // when
+        let host_is_anthropic = is_anthropic_host(anthropic_host);
+        let request_keeps_betas = should_include_betas_in_body(request_url);
+
+        // then
+        assert!(host_is_anthropic);
+        assert!(request_keeps_betas);
+    }
+
+    #[test]
+    fn non_anthropic_hosts_skip_body_betas() {
+        // given
+        let request_urls = [
+            "https://openrouter.ai/api/v1/messages",
+            "https://api.z.ai/api/anthropic/v1/messages",
+            "http://127.0.0.1:8080/v1/messages",
+            "https://litellm.example.com/v1/messages",
+        ];
+
+        // when
+        let includes_body_betas = request_urls
+            .iter()
+            .any(|request_url| should_include_betas_in_body(request_url));
+
+        // then
+        assert!(!includes_body_betas);
     }
 }

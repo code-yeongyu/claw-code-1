@@ -105,6 +105,14 @@ impl AnthropicRequestProfile {
     }
 
     pub fn render_json_body<T: Serialize>(&self, request: &T) -> Result<Value, serde_json::Error> {
+        self.render_json_body_with_betas(request, true)
+    }
+
+    pub fn render_json_body_with_betas<T: Serialize>(
+        &self,
+        request: &T,
+        include_betas: bool,
+    ) -> Result<Value, serde_json::Error> {
         let mut body = serde_json::to_value(request)?;
         let object = body.as_object_mut().ok_or_else(|| {
             serde_json::Error::io(std::io::Error::new(
@@ -115,7 +123,7 @@ impl AnthropicRequestProfile {
         for (key, value) in &self.extra_body {
             object.insert(key.clone(), value.clone());
         }
-        if !self.betas.is_empty() {
+        if include_betas && !self.betas.is_empty() {
             object.insert(
                 "betas".to_string(),
                 Value::Array(self.betas.iter().cloned().map(Value::String).collect()),
@@ -433,12 +441,14 @@ mod tests {
 
     #[test]
     fn request_profile_emits_headers_and_merges_body() {
+        // given
         let profile = AnthropicRequestProfile::new(
             ClientIdentity::new("claude-code", "1.2.3").with_runtime("rust-cli"),
         )
         .with_beta("tools-2026-04-01")
         .with_extra_body("metadata", serde_json::json!({"source": "test"}));
 
+        // when
         assert_eq!(
             profile.header_pairs(),
             vec![
@@ -458,6 +468,8 @@ mod tests {
         let body = profile
             .render_json_body(&serde_json::json!({"model": "claude-sonnet"}))
             .expect("body should serialize");
+
+        // then
         assert_eq!(
             body["metadata"]["source"],
             Value::String("test".to_string())
@@ -470,6 +482,38 @@ mod tests {
                 "tools-2026-04-01"
             ])
         );
+    }
+
+    #[test]
+    fn request_profile_skips_body_betas_when_requested() {
+        // given
+        let profile = AnthropicRequestProfile::new(
+            ClientIdentity::new("claude-code", "1.2.3").with_runtime("rust-cli"),
+        )
+        .with_beta("tools-2026-04-01")
+        .with_extra_body("metadata", serde_json::json!({"source": "test"}));
+
+        // when
+        let body = profile
+            .render_json_body_with_betas(&serde_json::json!({"model": "claude-sonnet"}), false)
+            .expect("body should serialize");
+
+        // then
+        assert_eq!(
+            profile
+                .header_pairs()
+                .into_iter()
+                .find(|(key, _)| key == "anthropic-beta")
+                .map(|(_, value)| value),
+            Some(
+                "claude-code-20250219,prompt-caching-scope-2026-01-05,tools-2026-04-01".to_string()
+            )
+        );
+        assert_eq!(
+            body["metadata"]["source"],
+            Value::String("test".to_string())
+        );
+        assert!(body.get("betas").is_none());
     }
 
     #[test]
