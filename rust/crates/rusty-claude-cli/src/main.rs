@@ -109,33 +109,57 @@ type RuntimePluginStateBuildOutput = (
     Vec<RuntimeToolDefinition>,
 );
 
-fn main() {
-    if let Err(error) = run() {
-        let message = error.to_string();
-        // When --output-format json is active, emit errors as JSON so downstream
-        // tools can parse failures the same way they parse successes (ROADMAP #42).
-        let argv: Vec<String> = std::env::args().collect();
-        let json_output = argv
-            .windows(2)
-            .any(|w| w[0] == "--output-format" && w[1] == "json")
-            || argv.iter().any(|a| a == "--output-format=json");
-        if json_output {
+/// Trait for errors that can provide structured JSON representation per §4.44.
+/// Implementors provide both human-readable prose (via Display) and
+/// machine-readable structure for JSON error envelopes.
+pub trait StructuredError: std::error::Error {
+    /// Returns the structured JSON representation of this error.
+    fn as_json(&self) -> serde_json::Value;
+    /// Returns the error kind/category for dispatch decisions.
+    fn error_kind(&self) -> &'static str;
+}
+
+/// Emit error in the appropriate format based on CLI flags.
+/// For structured errors in JSON mode, emits the full nested envelope.
+/// For plain errors or text mode, emits prose format.
+fn emit_error(error: &(dyn std::error::Error + 'static), json_mode: bool) {
+    if json_mode {
+        // Try structured emission for known typed errors (#132)
+        // Check for ExportError specifically first
+        if let Some(export_err) = error.downcast_ref::<ExportError>() {
+            eprintln!("{}", serde_json::to_string_pretty(&export_err.as_json()).unwrap());
+        } else {
+            // Fallback: prose wrapped in minimal JSON envelope
             eprintln!(
                 "{}",
                 serde_json::json!({
                     "type": "error",
-                    "error": message,
+                    "error": error.to_string(),
                 })
             );
-        } else if message.contains("`claw --help`") {
+        }
+    } else {
+        let message = error.to_string();
+        if message.contains("`claw --help`") {
             eprintln!("error: {message}");
         } else {
             eprintln!(
-                "error: {message}
-
-Run `claw --help` for usage."
+                "error: {message}\n\nRun `claw --help` for usage."
             );
         }
+    }
+}
+
+fn main() {
+    if let Err(error) = run() {
+        // When --output-format json is active, emit errors as JSON so downstream
+        // tools can parse failures the same way they parse successes (ROADMAP #42).
+        let argv: Vec<String> = std::env::args().collect();
+        let json_mode = argv
+            .windows(2)
+            .any(|w| w[0] == "--output-format" && w[1] == "json")
+            || argv.iter().any(|a| a == "--output-format=json");
+        emit_error(&*error, json_mode);
         std::process::exit(1);
     }
 }
@@ -6120,6 +6144,32 @@ impl std::fmt::Display for ExportError {
 }
 
 impl std::error::Error for ExportError {}
+
+impl StructuredError for ExportError {
+    fn as_json(&self) -> serde_json::Value {
+        json!({
+            "type": "error",
+            "error": {
+                "kind": self.kind,
+                "operation": self.operation,
+                "target": self.target,
+                "errno": self.errno,
+                "hint": self.hint,
+                "retryable": self.retryable,
+            },
+            "message": self.to_string(),
+        })
+    }
+
+    fn error_kind(&self) -> &'static str {
+        match self.kind.as_str() {
+            "filesystem" => "filesystem",
+            "permission" => "permission",
+            "invalid_path" => "invalid_path",
+            _ => "unknown",
+        }
+    }
+}
 
 /// Wrap std::io::Error into a structured ExportError per §4.44.
 fn wrap_export_io_error(path: &Path, op: &str, e: std::io::Error) -> ExportError {
