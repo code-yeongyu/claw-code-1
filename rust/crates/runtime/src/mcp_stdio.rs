@@ -18,15 +18,23 @@ use crate::mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
 };
 
+/// Default maximum time (ms) to wait for an MCP server `initialize`
+/// handshake before killing the child and marking the server unavailable.
+/// Prevents wedging Prompt invocations on slow or hung MCP startups (#129).
+/// Configurable per-server via `mcpServers.<name>.startupTimeoutMs`.
 #[cfg(test)]
-const MCP_INITIALIZE_TIMEOUT_MS: u64 = 200;
+pub const MCP_STARTUP_DEADLINE_MS: u64 = 200;
 #[cfg(not(test))]
-const MCP_INITIALIZE_TIMEOUT_MS: u64 = 10_000;
+pub const MCP_STARTUP_DEADLINE_MS: u64 = 10_000;
 
 #[cfg(test)]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 300;
 #[cfg(not(test))]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 30_000;
+
+/// Maximum number of consecutive startup failures before a server is
+/// marked permanently unavailable for the rest of the process (#129).
+const MCP_MAX_STARTUP_FAILURES: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
@@ -279,6 +287,11 @@ pub enum McpServerManagerError {
     UnknownServer {
         server_name: String,
     },
+    /// Server has been marked permanently unavailable after exceeding
+    /// the maximum allowed startup failures (#129).
+    ServerUnavailable {
+        server_name: String,
+    },
 }
 
 impl std::fmt::Display for McpServerManagerError {
@@ -322,6 +335,10 @@ impl std::fmt::Display for McpServerManagerError {
                 write!(f, "unknown MCP tool `{qualified_name}`")
             }
             Self::UnknownServer { server_name } => write!(f, "unknown MCP server `{server_name}`"),
+            Self::ServerUnavailable { server_name } => write!(
+                f,
+                "MCP server `{server_name}` is unavailable after repeated startup failures"
+            ),
         }
     }
 }
@@ -335,7 +352,8 @@ impl std::error::Error for McpServerManagerError {
             | Self::InvalidResponse { .. }
             | Self::Timeout { .. }
             | Self::UnknownTool { .. }
-            | Self::UnknownServer { .. } => None,
+            | Self::UnknownServer { .. }
+            | Self::ServerUnavailable { .. } => None,
         }
     }
 }
@@ -356,6 +374,7 @@ impl McpServerManagerError {
             | Self::Timeout { method, .. } => lifecycle_phase_for_method(method),
             Self::UnknownTool { .. } => McpLifecyclePhase::ToolDiscovery,
             Self::UnknownServer { .. } => McpLifecyclePhase::ServerRegistration,
+            Self::ServerUnavailable { .. } => McpLifecyclePhase::InitializeHandshake,
         }
     }
 
@@ -422,7 +441,7 @@ impl McpServerManagerError {
             Self::UnknownTool { qualified_name } => {
                 BTreeMap::from([("qualified_tool".to_string(), qualified_name.clone())])
             }
-            Self::UnknownServer { server_name } => {
+            Self::UnknownServer { server_name } | Self::ServerUnavailable { server_name } => {
                 BTreeMap::from([("server".to_string(), server_name.clone())])
             }
         }
@@ -464,6 +483,11 @@ struct ManagedMcpServer {
     bootstrap: McpClientBootstrap,
     process: Option<McpStdioProcess>,
     initialized: bool,
+    /// Consecutive startup failures for this server in the current process.
+    startup_failures: u32,
+    /// Once `startup_failures >= MCP_MAX_STARTUP_FAILURES`, the server is
+    /// permanently unavailable for the rest of the process lifetime (#129).
+    unavailable: bool,
 }
 
 impl ManagedMcpServer {
@@ -472,6 +496,17 @@ impl ManagedMcpServer {
             bootstrap,
             process: None,
             initialized: false,
+            startup_failures: 0,
+            unavailable: false,
+        }
+    }
+
+    /// Resolved startup timeout for the `initialize` handshake, reading
+    /// the per-server config override if present.
+    fn resolved_startup_timeout_ms(&self) -> u64 {
+        match &self.bootstrap.transport {
+            McpClientTransport::Stdio(t) => t.resolved_startup_timeout_ms(),
+            _ => MCP_STARTUP_DEADLINE_MS,
         }
     }
 }
@@ -1048,9 +1083,29 @@ impl McpServerManager {
         &mut self,
         server_name: &str,
     ) -> Result<(), McpServerManagerError> {
+        // --- #129 guard: permanently unavailable after too many failures ---
+        if self
+            .servers
+            .get(server_name)
+            .map(|s| s.unavailable)
+            .unwrap_or(false)
+        {
+            return Err(McpServerManagerError::ServerUnavailable {
+                server_name: server_name.to_string(),
+            });
+        }
+
         if self.server_process_exited(server_name)? {
             self.reset_server(server_name).await?;
         }
+
+        // Use the per-server startup deadline instead of the compile-time
+        // constant so users can tune via `startupTimeoutMs` (#129).
+        let startup_timeout_ms = self
+            .servers
+            .get(server_name)
+            .map(|s| s.resolved_startup_timeout_ms())
+            .unwrap_or(MCP_STARTUP_DEADLINE_MS);
 
         let mut attempts = 0;
         loop {
@@ -1093,7 +1148,7 @@ impl McpServerManager {
                 Self::run_process_request(
                     server_name,
                     "initialize",
-                    MCP_INITIALIZE_TIMEOUT_MS,
+                    startup_timeout_ms,
                     process.initialize(request_id, default_initialize_params()),
                 )
                 .await
@@ -1102,19 +1157,18 @@ impl McpServerManager {
             let response = match response {
                 Ok(response) => response,
                 Err(error) if attempts == 0 && Self::is_retryable_error(&error) => {
-                    self.reset_server(server_name).await?;
+                    self.record_startup_failure(server_name).await?;
                     attempts += 1;
                     continue;
                 }
                 Err(error) => {
-                    if Self::should_reset_server(&error) {
-                        self.reset_server(server_name).await?;
-                    }
+                    self.record_startup_failure(server_name).await?;
                     return Err(error);
                 }
             };
 
             if let Some(error) = response.error {
+                self.record_startup_failure(server_name).await?;
                 return Err(McpServerManagerError::JsonRpc {
                     server_name: server_name.to_string(),
                     method: "initialize",
@@ -1128,14 +1182,38 @@ impl McpServerManager {
                     method: "initialize",
                     details: "missing result payload".to_string(),
                 };
-                self.reset_server(server_name).await?;
+                self.record_startup_failure(server_name).await?;
                 return Err(error);
             }
 
+            // Success — reset failure counter.
             let server = self.server_mut(server_name)?;
             server.initialized = true;
+            server.startup_failures = 0;
             return Ok(());
         }
+    }
+
+    /// Record a startup failure for the named server.  If the cumulative
+    /// failure count reaches `MCP_MAX_STARTUP_FAILURES`, mark the server
+    /// permanently unavailable so subsequent calls skip it (#129).
+    async fn record_startup_failure(
+        &mut self,
+        server_name: &str,
+    ) -> Result<(), McpServerManagerError> {
+        self.reset_server(server_name).await?;
+        if let Some(server) = self.servers.get_mut(server_name) {
+            server.startup_failures += 1;
+            if server.startup_failures >= MCP_MAX_STARTUP_FAILURES {
+                server.unavailable = true;
+                eprintln!(
+                    "mcp: server '{server_name}' marked unavailable after \
+                     {count} consecutive startup failures",
+                    count = server.startup_failures,
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1771,6 +1849,7 @@ mod tests {
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "secret-value".to_string())]),
                 tool_call_timeout_ms: None,
+                startup_timeout_ms: None,
             }),
         };
         McpClientBootstrap::from_scoped_config("stdio server", &config)
@@ -1789,6 +1868,7 @@ mod tests {
             args: vec![script_path.to_string_lossy().into_owned()],
             env,
             tool_call_timeout_ms: None,
+            startup_timeout_ms: None,
         }
     }
 
@@ -1838,6 +1918,7 @@ mod tests {
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env,
                 tool_call_timeout_ms: None,
+                startup_timeout_ms: None,
             }),
         }
     }
@@ -2057,6 +2138,7 @@ mod tests {
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "direct-secret".to_string())]),
                 tool_call_timeout_ms: None,
+                startup_timeout_ms: None,
             };
             let mut process = McpStdioProcess::spawn(&transport).expect("spawn transport directly");
             let ready = process.read_available().await.expect("read ready");
@@ -2319,6 +2401,7 @@ mod tests {
                             "200".to_string(),
                         )]),
                         tool_call_timeout_ms: Some(25),
+                        startup_timeout_ms: None,
                     }),
                 },
             )]);
@@ -2372,6 +2455,7 @@ mod tests {
                             "1".to_string(),
                         )]),
                         tool_call_timeout_ms: Some(1_000),
+                        startup_timeout_ms: None,
                     }),
                 },
             )]);
@@ -2707,6 +2791,7 @@ mod tests {
                             args: Vec::new(),
                             env: BTreeMap::new(),
                             tool_call_timeout_ms: None,
+                            startup_timeout_ms: None,
                         }),
                     },
                 ),
@@ -2924,5 +3009,176 @@ mod tests {
 
             cleanup_script(&script_path);
         });
+    }
+
+    // ---- ROADMAP #129 regression tests ----
+
+    #[test]
+    fn mcp_server_marked_unavailable_after_repeated_startup_failures() {
+        // given: an MCP server config pointing to a non-existent command
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let servers = BTreeMap::from([(
+                "broken".to_string(),
+                ScopedMcpServerConfig {
+                    scope: ConfigSource::Local,
+                    config: McpServerConfig::Stdio(McpStdioServerConfig {
+                        command: "/this/binary/does/not/exist".to_string(),
+                        args: Vec::new(),
+                        env: BTreeMap::new(),
+                        tool_call_timeout_ms: None,
+                        startup_timeout_ms: None,
+                    }),
+                },
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            // when: discover_tools_best_effort is called (triggers ensure_server_ready)
+            let report = manager.discover_tools_best_effort().await;
+
+            // then: the server appears in failed_servers
+            assert!(
+                report
+                    .failed_servers
+                    .iter()
+                    .any(|f| f.server_name == "broken"),
+                "broken server should appear in failed servers"
+            );
+
+            // when: we attempt discovery again after the server was already marked failed
+            let report2 = manager.discover_tools_best_effort().await;
+
+            // then: the server is still listed as failed (unavailable), not retried forever
+            assert!(
+                report2
+                    .failed_servers
+                    .iter()
+                    .any(|f| f.server_name == "broken"),
+                "broken server should still be in failed servers on second attempt"
+            );
+        });
+    }
+
+    #[test]
+    fn mcp_startup_timeout_prevents_indefinite_hang() {
+        // given: an MCP server script that starts but never sends an initialize response
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("hang_server.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import time, sys",
+            "# Hang forever — never send an initialize response",
+            "while True:",
+            "    time.sleep(60)",
+        ];
+        fs::write(&script_path, script.join("\n")).expect("write hang script");
+
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let servers = BTreeMap::from([(
+                "hang".to_string(),
+                ScopedMcpServerConfig {
+                    scope: ConfigSource::Local,
+                    config: McpServerConfig::Stdio(McpStdioServerConfig {
+                        command: "python3".to_string(),
+                        args: vec![script_path.to_string_lossy().into_owned()],
+                        env: BTreeMap::new(),
+                        tool_call_timeout_ms: None,
+                        // Use a very short deadline so the test doesn't hang
+                        startup_timeout_ms: Some(100),
+                    }),
+                },
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            // when: discover_tools_best_effort is called
+            let started = std::time::Instant::now();
+            let report = manager.discover_tools_best_effort().await;
+            let elapsed = started.elapsed();
+
+            // then: the operation completes within the deadline (with margin)
+            assert!(
+                elapsed.as_millis() < 3000,
+                "MCP startup should respect the deadline, took {elapsed:?}"
+            );
+
+            // then: the server appears in failed_servers, not tools
+            assert!(
+                report.tools.is_empty(),
+                "no tools should be discovered from a hanging server"
+            );
+            assert!(
+                report
+                    .failed_servers
+                    .iter()
+                    .any(|f| f.server_name == "hang"),
+                "hanging server should appear in failed servers"
+            );
+        });
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mcp_startup_uses_per_server_startup_timeout_ms_config() {
+        // given: an MCP server with a custom short startupTimeoutMs
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("slow_init.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import time, sys",
+            "# Sleep longer than the configured startupTimeoutMs",
+            "time.sleep(60)",
+        ];
+        fs::write(&script_path, script.join("\n")).expect("write slow script");
+
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let servers = BTreeMap::from([(
+                "slow".to_string(),
+                ScopedMcpServerConfig {
+                    scope: ConfigSource::Local,
+                    config: McpServerConfig::Stdio(McpStdioServerConfig {
+                        command: "python3".to_string(),
+                        args: vec![script_path.to_string_lossy().into_owned()],
+                        env: BTreeMap::new(),
+                        tool_call_timeout_ms: None,
+                        startup_timeout_ms: Some(50),
+                    }),
+                },
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            // when: discover_tools is called
+            let started = std::time::Instant::now();
+            let report = manager.discover_tools_best_effort().await;
+            let elapsed = started.elapsed();
+
+            // then: times out within the configured deadline (50ms + retry tolerance)
+            assert!(
+                elapsed.as_millis() < 2000,
+                "should respect startupTimeoutMs=50, took {elapsed:?}"
+            );
+            assert!(
+                report
+                    .failed_servers
+                    .iter()
+                    .any(|f| f.server_name == "slow"),
+                "slow server should fail due to startup timeout"
+            );
+        });
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

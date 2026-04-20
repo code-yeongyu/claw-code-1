@@ -454,6 +454,7 @@ mod tests {
                     ),
                 ]),
                 tool_call_timeout_ms: Some(1_000),
+                startup_timeout_ms: None,
             }),
         }
     }
