@@ -375,6 +375,9 @@ enum LocalHelpTopic {
     Sandbox,
     Doctor,
     Acp,
+    Version,
+    Help,
+    Skills,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -652,12 +655,36 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
         }),
         "skills" => {
-            let args = join_optional_args(&rest[1..]);
+            // Split recognised suffix flags (--json, --help) from skill
+            // dispatch args so `claw skills --json` works while `claw
+            // skills list` still routes to the local listing.
+            let suffix: Vec<String> = rest[1..]
+                .iter()
+                .filter(|a| a.starts_with('-'))
+                .cloned()
+                .collect();
+            let positional: Vec<&String> =
+                rest[1..].iter().filter(|a| !a.starts_with('-')).collect();
+            let (fmt, help) = parse_verb_suffix("skills", &suffix, output_format)?;
+            if help {
+                return Ok(CliAction::HelpTopic(LocalHelpTopic::Skills));
+            }
+            let args = if positional.is_empty() {
+                None
+            } else {
+                Some(
+                    positional
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            };
             match classify_skills_slash_command(args.as_deref()) {
                 SkillSlashDispatch::Invoke(prompt) => Ok(CliAction::Prompt {
                     prompt,
                     model,
-                    output_format,
+                    output_format: fmt,
                     allowed_tools,
                     permission_mode,
                     compact,
@@ -667,8 +694,54 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
-                    output_format,
+                    output_format: fmt,
                 }),
+            }
+        }
+        // Verb subcommands that accept --json / --help suffix flags.
+        // Guard: only enter this arm when all trailing tokens start with
+        // `-` (flags), so multi-word prompts like "help me debug" still
+        // fall through to the catch-all Prompt arm.
+        "doctor" | "status" | "sandbox" | "version" | "help" | "state"
+            if rest[1..].is_empty() || rest[1..].iter().all(|a| a.starts_with('-')) =>
+        {
+            let verb = rest[0].as_str();
+            let (fmt, help) = parse_verb_suffix(verb, &rest[1..], output_format)?;
+            if help {
+                return match verb {
+                    "doctor" => Ok(CliAction::HelpTopic(LocalHelpTopic::Doctor)),
+                    "status" => Ok(CliAction::HelpTopic(LocalHelpTopic::Status)),
+                    "sandbox" => Ok(CliAction::HelpTopic(LocalHelpTopic::Sandbox)),
+                    "version" => Ok(CliAction::HelpTopic(LocalHelpTopic::Version)),
+                    "help" => Ok(CliAction::HelpTopic(LocalHelpTopic::Help)),
+                    // state has no dedicated topic yet; show top-level help
+                    _ => Ok(CliAction::Help {
+                        output_format: fmt,
+                    }),
+                };
+            }
+            match verb {
+                "doctor" => Ok(CliAction::Doctor {
+                    output_format: fmt,
+                }),
+                "status" => Ok(CliAction::Status {
+                    model: model.to_string(),
+                    permission_mode,
+                    output_format: fmt,
+                }),
+                "sandbox" => Ok(CliAction::Sandbox {
+                    output_format: fmt,
+                }),
+                "version" => Ok(CliAction::Version {
+                    output_format: fmt,
+                }),
+                "help" => Ok(CliAction::Help {
+                    output_format: fmt,
+                }),
+                "state" => Ok(CliAction::State {
+                    output_format: fmt,
+                }),
+                _ => unreachable!(),
             }
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
@@ -728,6 +801,9 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
         "sandbox" => LocalHelpTopic::Sandbox,
         "doctor" => LocalHelpTopic::Doctor,
         "acp" => LocalHelpTopic::Acp,
+        "version" => LocalHelpTopic::Version,
+        "help" => LocalHelpTopic::Help,
+        "skills" => LocalHelpTopic::Skills,
         _ => return None,
     };
     Some(Ok(CliAction::HelpTopic(topic)))
@@ -739,25 +815,19 @@ fn is_help_flag(value: &str) -> bool {
 
 fn parse_single_word_command_alias(
     rest: &[String],
-    model: &str,
-    permission_mode_override: Option<PermissionMode>,
-    output_format: CliOutputFormat,
+    _model: &str,
+    _permission_mode_override: Option<PermissionMode>,
+    _output_format: CliOutputFormat,
 ) -> Option<Result<CliAction, String>> {
     if rest.len() != 1 {
         return None;
     }
 
+    // Verbs that support --json / --help suffix are now handled in the
+    // rest[0] match block inside parse_args so they can accept trailing
+    // flags.  Only the bare-slash-command guidance path remains here.
     match rest[0].as_str() {
-        "help" => Some(Ok(CliAction::Help { output_format })),
-        "version" => Some(Ok(CliAction::Version { output_format })),
-        "status" => Some(Ok(CliAction::Status {
-            model: model.to_string(),
-            permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
-            output_format,
-        })),
-        "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
-        "doctor" => Some(Ok(CliAction::Doctor { output_format })),
-        "state" => Some(Ok(CliAction::State { output_format })),
+        "help" | "version" | "status" | "sandbox" | "doctor" | "state" => None,
         other => bare_slash_command_guidance(other).map(Err),
     }
 }
@@ -892,6 +962,10 @@ fn parse_direct_slash_cli_action(
 }
 
 fn format_unknown_option(option: &str) -> String {
+    if option == "--json" {
+        return "unknown option: --json\nHint: use `claw --output-format json` or `claw <command> --json`."
+            .to_string();
+    }
     let mut message = format!("unknown option: {option}");
     if let Some(suggestion) = suggest_closest_term(option, CLI_OPTION_SUGGESTIONS) {
         message.push_str("\nDid you mean ");
@@ -900,6 +974,31 @@ fn format_unknown_option(option: &str) -> String {
     }
     message.push_str("\nRun `claw --help` for usage.");
     message
+}
+
+fn format_unknown_verb_option(verb: &str, option: &str) -> String {
+    format!("error: unknown {verb} option: {option}")
+}
+
+/// Parse trailing flags after a simple verb subcommand (doctor, status,
+/// sandbox, skills, version, help).  Recognises `--json` as an alias for
+/// `--output-format json` and `--help`/`-h`.  Rejects anything else with a
+/// loud error that names the verb.
+fn parse_verb_suffix(
+    verb: &str,
+    suffix: &[String],
+    base_output_format: CliOutputFormat,
+) -> Result<(CliOutputFormat, bool), String> {
+    let mut output_format = base_output_format;
+    let mut wants_help = false;
+    for arg in suffix {
+        match arg.as_str() {
+            "--json" => output_format = CliOutputFormat::Json,
+            "--help" | "-h" => wants_help = true,
+            other => return Err(format_unknown_verb_option(verb, other)),
+        }
+    }
+    Ok((output_format, wants_help))
 }
 
 fn format_unknown_direct_slash_command(name: &str) -> String {
@@ -5181,20 +5280,23 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
 fn render_help_topic(topic: LocalHelpTopic) -> String {
     match topic {
         LocalHelpTopic::Status => "Status
-  Usage            claw status
+  Usage            claw status [--json]
   Purpose          show the local workspace snapshot without entering the REPL
+  Flags            --json   alias for --output-format json
   Output           model, permissions, git state, config files, and sandbox status
   Related          /status · claw --resume latest /status"
             .to_string(),
         LocalHelpTopic::Sandbox => "Sandbox
-  Usage            claw sandbox
+  Usage            claw sandbox [--json]
   Purpose          inspect the resolved sandbox and isolation state for the current directory
+  Flags            --json   alias for --output-format json
   Output           namespace, network, filesystem, and fallback details
   Related          /sandbox · claw status"
             .to_string(),
         LocalHelpTopic::Doctor => "Doctor
-  Usage            claw doctor
+  Usage            claw doctor [--json]
   Purpose          diagnose local auth, config, workspace, sandbox, and build metadata
+  Flags            --json   alias for --output-format json
   Output           local-only health report; no provider request or session resume required
   Related          /doctor · claw --resume latest /doctor"
             .to_string(),
@@ -5204,6 +5306,24 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Purpose          explain the current editor-facing ACP/Zed launch contract without starting the runtime
   Status           discoverability only; `serve` is a status alias and does not launch a daemon yet
   Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · claw --help"
+            .to_string(),
+        LocalHelpTopic::Version => "Version
+  Usage            claw version [--json]
+  Purpose          print version and build metadata locally
+  Flags            --json   alias for --output-format json
+  Related          claw --version · claw -V"
+            .to_string(),
+        LocalHelpTopic::Help => "Help
+  Usage            claw help [--json]
+  Purpose          show full CLI usage text
+  Flags            --json   alias for --output-format json
+  Related          claw --help · claw -h"
+            .to_string(),
+        LocalHelpTopic::Skills => "Skills
+  Usage            claw skills [--json]
+  Purpose          list discovered project and user skills
+  Flags            --json   alias for --output-format json
+  Related          /skills · claw --resume latest /skills"
             .to_string(),
     }
 }
@@ -8195,18 +8315,18 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Inspect or maintain a saved session without entering the REPL"
     )?;
-    writeln!(out, "  claw help")?;
+    writeln!(out, "  claw help [--json]")?;
     writeln!(out, "      Alias for --help")?;
-    writeln!(out, "  claw version")?;
+    writeln!(out, "  claw version [--json]")?;
     writeln!(out, "      Alias for --version")?;
-    writeln!(out, "  claw status")?;
+    writeln!(out, "  claw status [--json]")?;
     writeln!(
         out,
         "      Show the current local workspace status snapshot"
     )?;
-    writeln!(out, "  claw sandbox")?;
+    writeln!(out, "  claw sandbox [--json]")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
-    writeln!(out, "  claw doctor")?;
+    writeln!(out, "  claw doctor [--json]")?;
     writeln!(
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
@@ -8225,7 +8345,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw bootstrap-plan")?;
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp")?;
-    writeln!(out, "  claw skills")?;
+    writeln!(out, "  claw skills [--json]")?;
     writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
     writeln!(out, "  claw init")?;
     writeln!(
@@ -8421,6 +8541,7 @@ mod tests {
             request_id: Some("req_jobdori_789".to_string()),
             body: String::new(),
             retryable: true,
+            suggested_action: None,
         };
 
         let rendered = format_user_visible_api_error("session-issue-22", &error);
@@ -8443,6 +8564,7 @@ mod tests {
                 request_id: Some("req_jobdori_790".to_string()),
                 body: String::new(),
                 retryable: true,
+                suggested_action: None,
             }),
         };
 
@@ -8506,6 +8628,7 @@ mod tests {
             request_id: Some("req_ctx_456".to_string()),
             body: String::new(),
             retryable: false,
+            suggested_action: None,
         };
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);
@@ -8537,6 +8660,7 @@ mod tests {
                 request_id: Some("req_ctx_retry_789".to_string()),
                 body: String::new(),
                 retryable: false,
+                suggested_action: None,
             }),
         };
 
@@ -9879,6 +10003,134 @@ mod tests {
         assert!(error.contains("Did you mean --resume?"));
         assert!(error.contains("claw --help"));
     }
+
+    // --- #127 verb-suffix regression tests (a-g) ---
+
+    #[test]
+    fn verb_suffix_a_doctor_json_alias() {
+        // given
+        let args = vec!["doctor".to_string(), "--json".to_string()];
+
+        // when
+        let parsed = parse_args(&args).expect("doctor --json should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Doctor {
+                output_format: CliOutputFormat::Json,
+            }
+        );
+    }
+
+    #[test]
+    fn verb_suffix_b_status_json_alias() {
+        // given
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["status".to_string(), "--json".to_string()];
+
+        // when
+        let parsed = parse_args(&args).expect("status --json should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Status {
+                model: DEFAULT_MODEL.to_string(),
+                permission_mode: PermissionMode::DangerFullAccess,
+                output_format: CliOutputFormat::Json,
+            }
+        );
+    }
+
+    #[test]
+    fn verb_suffix_c_sandbox_json_alias() {
+        // given
+        let args = vec!["sandbox".to_string(), "--json".to_string()];
+
+        // when
+        let parsed = parse_args(&args).expect("sandbox --json should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Sandbox {
+                output_format: CliOutputFormat::Json,
+            }
+        );
+    }
+
+    #[test]
+    fn verb_suffix_d_skills_json_alias() {
+        // given
+        let args = vec!["skills".to_string(), "--json".to_string()];
+
+        // when
+        let parsed = parse_args(&args).expect("skills --json should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Skills {
+                args: None,
+                output_format: CliOutputFormat::Json,
+            }
+        );
+    }
+
+    #[test]
+    fn verb_suffix_e_version_json_alias() {
+        // given
+        let args = vec!["version".to_string(), "--json".to_string()];
+
+        // when
+        let parsed = parse_args(&args).expect("version --json should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Version {
+                output_format: CliOutputFormat::Json,
+            }
+        );
+    }
+
+    #[test]
+    fn verb_suffix_f_rejects_unknown_post_subcommand_arg() {
+        // given
+        let args = vec!["doctor".to_string(), "--unknown".to_string()];
+
+        // when
+        let error = parse_args(&args).expect_err("unknown verb option should fail");
+
+        // then
+        assert!(
+            error.contains("error: unknown doctor option: --unknown"),
+            "expected verb-specific error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn verb_suffix_g_global_json_flag_suggests_output_format() {
+        // given
+        let args = vec!["--json".to_string()];
+
+        // when
+        let error = parse_args(&args).expect_err("--json as global flag should fail");
+
+        // then
+        assert!(
+            error.contains("--output-format json"),
+            "should suggest --output-format json, got: {error}"
+        );
+        assert!(
+            error.contains("claw <command> --json"),
+            "should suggest per-verb --json, got: {error}"
+        );
+    }
+
+    // --- end #127 verb-suffix regression tests ---
 
     #[test]
     fn parses_resume_flag_with_slash_command_arguments() {
