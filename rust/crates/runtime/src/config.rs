@@ -134,6 +134,10 @@ pub struct McpStdioServerConfig {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub tool_call_timeout_ms: Option<u64>,
+    /// Maximum time (ms) to wait for the `initialize` handshake before
+    /// killing the child and marking the server unavailable.  Defaults
+    /// to 10 000 ms (see `MCP_STARTUP_DEADLINE_MS`).
+    pub startup_timeout_ms: Option<u64>,
 }
 
 /// Configuration for an MCP server reached over HTTP or SSE.
@@ -964,6 +968,7 @@ fn parse_mcp_server_config(
             args: optional_string_array(object, "args", context)?.unwrap_or_default(),
             env: optional_string_map(object, "env", context)?.unwrap_or_default(),
             tool_call_timeout_ms: optional_u64(object, "toolCallTimeoutMs", context)?,
+            startup_timeout_ms: optional_u64(object, "startupTimeoutMs", context)?,
         })),
         "sse" => Ok(McpServerConfig::Sse(parse_mcp_remote_server_config(
             object, context,
