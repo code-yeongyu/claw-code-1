@@ -233,6 +233,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allow_broad_cwd,
         } => {
             enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
+            // Fail-fast: validate provider credentials BEFORE MCP server
+            // spawn so a missing API key surfaces in milliseconds instead
+            // of hanging on a slow MCP child handshake (#129).
+            preflight_provider_credentials(&model)?;
             run_stale_base_preflight(base_commit.as_deref());
             // Only consume piped stdin as prompt context when the permission
             // mode is fully unattended. In modes where the permission
@@ -3076,6 +3080,9 @@ fn run_repl(
     allow_broad_cwd: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
+    // Fail-fast: validate provider credentials BEFORE MCP server
+    // spawn so a missing API key surfaces immediately (#129).
+    preflight_provider_credentials(&model)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
@@ -6844,6 +6851,24 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }
 
+/// Cheap credential pre-flight for the Prompt dispatch path.
+///
+/// When the resolved provider is Anthropic, validates that at least one
+/// auth env var is present *before* MCP servers are spawned.  This
+/// prevents a slow or hanging MCP child process from masking a missing
+/// API key error that would otherwise surface in milliseconds.
+///
+/// Non-Anthropic providers (OpenAI-compat, xAI) perform their own
+/// credential resolution during client construction, so we skip the
+/// pre-check for those — their startup is not blocked by MCP ordering.
+fn preflight_provider_credentials(model: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let resolved = api::resolve_model_alias(model);
+    if detect_provider_kind(&resolved) == ProviderKind::Anthropic {
+        resolve_cli_auth_source()?;
+    }
+    Ok(())
+}
+
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -8421,6 +8446,7 @@ mod tests {
             request_id: Some("req_jobdori_789".to_string()),
             body: String::new(),
             retryable: true,
+            suggested_action: None,
         };
 
         let rendered = format_user_visible_api_error("session-issue-22", &error);
@@ -8443,6 +8469,7 @@ mod tests {
                 request_id: Some("req_jobdori_790".to_string()),
                 body: String::new(),
                 retryable: true,
+                suggested_action: None,
             }),
         };
 
@@ -8506,6 +8533,7 @@ mod tests {
             request_id: Some("req_ctx_456".to_string()),
             body: String::new(),
             retryable: false,
+            suggested_action: None,
         };
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);
@@ -8537,6 +8565,7 @@ mod tests {
                 request_id: Some("req_ctx_retry_789".to_string()),
                 body: String::new(),
                 retryable: false,
+                suggested_action: None,
             }),
         };
 
@@ -11651,6 +11680,58 @@ UU conflicted.rs",
                 "stub command {with_slash} should not appear in REPL completions"
             );
         }
+    }
+
+    // ---- ROADMAP #129 regression tests ----
+
+    #[test]
+    fn preflight_provider_credentials_fails_fast_for_anthropic_without_creds() {
+        // given: no Anthropic credentials in the environment
+        let _guard = env_lock();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+
+        // when: preflight check runs for the default (Anthropic) model
+        let result = super::preflight_provider_credentials(DEFAULT_MODEL);
+
+        // then: it fails immediately with a credential error
+        let err = result.expect_err("should fail without Anthropic creds");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ANTHROPIC_AUTH_TOKEN") || msg.contains("ANTHROPIC_API_KEY"),
+            "error should mention the required env vars, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_provider_credentials_succeeds_with_anthropic_api_key() {
+        // given: ANTHROPIC_API_KEY is set
+        let _guard = env_lock();
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-dummy");
+
+        // when: preflight check runs for the default model
+        let result = super::preflight_provider_credentials(DEFAULT_MODEL);
+
+        // then: it succeeds
+        assert!(result.is_ok(), "should pass with ANTHROPIC_API_KEY set");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn preflight_provider_credentials_skips_check_for_openai_model() {
+        // given: no Anthropic credentials, but an openai/ model prefix
+        let _guard = env_lock();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+
+        // when: preflight check runs for an openai-prefixed model
+        let result = super::preflight_provider_credentials("openai/gpt-4");
+
+        // then: it succeeds (skips Anthropic cred check for non-Anthropic providers)
+        assert!(
+            result.is_ok(),
+            "should not check Anthropic creds for openai/ model"
+        );
     }
 }
 
