@@ -699,13 +699,33 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
         }
         // Verb subcommands that accept --json / --help suffix flags.
-        // Guard: only enter this arm when all trailing tokens start with
-        // `-` (flags), so multi-word prompts like "help me debug" still
-        // fall through to the catch-all Prompt arm.
-        "doctor" | "status" | "sandbox" | "version" | "help" | "state"
-            if rest[1..].is_empty() || rest[1..].iter().all(|a| a.starts_with('-')) =>
-        {
+        // Multi-word prompts like "help me debug" are disambiguated
+        // inside the arm: positional args are rejected unless the verb
+        // is "help" and the tail looks like a natural-language prompt
+        // (first trailing token does not start with '-' and there are
+        // at least two trailing tokens).
+        "doctor" | "status" | "sandbox" | "version" | "help" | "state" => {
             let verb = rest[0].as_str();
+
+            // "help me debug" (2+ trailing positional words) stays as a
+            // prompt shorthand so existing claw behaviour is preserved.
+            if verb == "help"
+                && rest.len() >= 3
+                && !rest[1].starts_with('-')
+            {
+                return Ok(CliAction::Prompt {
+                    prompt: rest.join(" "),
+                    model,
+                    output_format,
+                    allowed_tools,
+                    permission_mode,
+                    compact,
+                    base_commit,
+                    reasoning_effort: reasoning_effort.clone(),
+                    allow_broad_cwd,
+                });
+            }
+
             let (fmt, help) = parse_verb_suffix(verb, &rest[1..], output_format)?;
             if help {
                 return match verb {
@@ -976,8 +996,17 @@ fn format_unknown_option(option: &str) -> String {
     message
 }
 
-fn format_unknown_verb_option(verb: &str, option: &str) -> String {
-    format!("error: unknown {verb} option: {option}")
+fn format_unknown_verb_option(verb: &str, arg: &str) -> String {
+    if arg == "--json" {
+        return format!(
+            "unknown {verb} option: {arg}; did you mean --output-format json?"
+        );
+    }
+    if arg.starts_with('-') {
+        format!("unknown {verb} option: {arg}")
+    } else {
+        format!("unknown {verb} argument: {arg}")
+    }
 }
 
 /// Parse trailing flags after a simple verb subcommand (doctor, status,
@@ -1282,7 +1311,7 @@ fn parse_system_prompt_args(
                 date.clone_from(value);
                 index += 2;
             }
-            other => return Err(format!("unknown system-prompt option: {other}")),
+            other => return Err(format_unknown_verb_option("system-prompt", other)),
         }
     }
 
@@ -10097,17 +10126,21 @@ mod tests {
     }
 
     #[test]
-    fn verb_suffix_f_rejects_unknown_post_subcommand_arg() {
+    fn verb_suffix_f_rejects_unknown_post_subcommand_flag() {
         // given
         let args = vec!["doctor".to_string(), "--unknown".to_string()];
 
         // when
         let error = parse_args(&args).expect_err("unknown verb option should fail");
 
-        // then
+        // then — no double "error:" prefix (BUG 3)
         assert!(
-            error.contains("error: unknown doctor option: --unknown"),
+            error.contains("unknown doctor option: --unknown"),
             "expected verb-specific error, got: {error}"
+        );
+        assert!(
+            !error.starts_with("error:"),
+            "parse_args must not add error: prefix (wrapper does that), got: {error}"
         );
     }
 
@@ -10127,6 +10160,51 @@ mod tests {
         assert!(
             error.contains("claw <command> --json"),
             "should suggest per-verb --json, got: {error}"
+        );
+    }
+
+    #[test]
+    fn verb_suffix_h_rejects_positional_arg_after_verb() {
+        // given — BUG 1: positional args must not fall through to Prompt
+        let args = vec!["doctor".to_string(), "garbage".to_string()];
+
+        // when
+        let error = parse_args(&args).expect_err("positional after verb should fail");
+
+        // then
+        assert!(
+            error.contains("unknown doctor argument: garbage"),
+            "expected positional rejection, got: {error}"
+        );
+    }
+
+    #[test]
+    fn verb_suffix_i_system_prompt_json_suggests_output_format() {
+        // given — BUG 2: --json on non-alias verb must suggest --output-format json
+        let args = vec!["system-prompt".to_string(), "--json".to_string()];
+
+        // when
+        let error = parse_args(&args).expect_err("system-prompt --json should fail");
+
+        // then
+        assert!(
+            error.contains("did you mean --output-format json?"),
+            "should suggest --output-format json, got: {error}"
+        );
+    }
+
+    #[test]
+    fn verb_suffix_j_no_double_error_prefix() {
+        // given — BUG 3: format_unknown_verb_option must not include error: prefix
+        let args = vec!["doctor".to_string(), "--garbageflag".to_string()];
+
+        // when
+        let error = parse_args(&args).expect_err("unknown flag should fail");
+
+        // then — message starts with "unknown", not "error: unknown"
+        assert!(
+            error.starts_with("unknown doctor option:"),
+            "must not have error: prefix, got: {error}"
         );
     }
 
