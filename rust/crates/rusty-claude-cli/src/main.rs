@@ -1194,8 +1194,55 @@ fn parse_system_prompt_args(
     })
 }
 
+/// Classify whether a positional argument is a session reference or an output path (#131).
+/// Session-shaped: matches `session-<digits>-<digits>`, or is an alias (latest/last/recent),
+/// or contains no path separator AND no file extension AND no known file marker.
+/// Path-shaped: has a file extension OR contains path separators (`/`, `\`).
+/// Ambiguous: requires explicit --session/--output to disambiguate.
+#[derive(Debug, PartialEq, Eq)]
+enum ExportPositionalKind {
+    SessionReference,
+    OutputPath,
+    Ambiguous,
+}
+
+fn classify_export_positional(arg: &str) -> ExportPositionalKind {
+    // Empty → ambiguous (caller will error)
+    if arg.is_empty() {
+        return ExportPositionalKind::Ambiguous;
+    }
+
+    // Path separator → definitely a path
+    if arg.contains('/') || arg.contains('\\') {
+        return ExportPositionalKind::OutputPath;
+    }
+
+    // Known session reference aliases
+    if matches!(arg, "latest" | "last" | "recent") {
+        return ExportPositionalKind::SessionReference;
+    }
+
+    // File extension → path (e.g., .md, .txt, .json)
+    if let Some(ext) = Path::new(arg).extension().and_then(|e| e.to_str()) {
+        if !ext.is_empty() {
+            return ExportPositionalKind::OutputPath;
+        }
+    }
+
+    // Session ID pattern: `session-<digits>-<digits>` or just `session-<digits>`
+    // These are the two patterns the session store actually produces.
+    if arg.starts_with("session-") {
+        return ExportPositionalKind::SessionReference;
+    }
+
+    // No extension, no separator, no known session pattern — ambiguous.
+    // Safer to error than silently fall back to latest.
+    ExportPositionalKind::Ambiguous
+}
+
 fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     let mut session_reference = LATEST_SESSION_REFERENCE.to_string();
+    let mut session_explicit = false;
     let mut output_path: Option<PathBuf> = None;
     let mut index = 0;
 
@@ -1206,10 +1253,12 @@ fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --session".to_string())?;
                 session_reference.clone_from(value);
+                session_explicit = true;
                 index += 2;
             }
             flag if flag.starts_with("--session=") => {
                 session_reference = flag[10..].to_string();
+                session_explicit = true;
                 index += 1;
             }
             "--output" | "-o" => {
@@ -1226,12 +1275,36 @@ fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<
             other if other.starts_with('-') => {
                 return Err(format!("unknown export option: {other}"));
             }
-            other if output_path.is_none() => {
-                output_path = Some(PathBuf::from(other));
-                index += 1;
-            }
             other => {
-                return Err(format!("unexpected export argument: {other}"));
+                // #131 fix: classify positional args instead of defaulting to output_path.
+                // Previously, ANY positional was treated as output_path which silently substituted
+                // LATEST for the session reference, causing "I asked for A, got B" bugs.
+                match classify_export_positional(other) {
+                    ExportPositionalKind::SessionReference if !session_explicit => {
+                        session_reference = other.to_string();
+                        session_explicit = true;
+                        index += 1;
+                    }
+                    ExportPositionalKind::OutputPath if output_path.is_none() => {
+                        output_path = Some(PathBuf::from(other));
+                        index += 1;
+                    }
+                    ExportPositionalKind::Ambiguous => {
+                        return Err(format!(
+                            "ambiguous export argument: '{other}'\n  hint: use --session {other} for session reference or --output {other} for output path"
+                        ));
+                    }
+                    ExportPositionalKind::SessionReference => {
+                        return Err(format!(
+                            "duplicate session reference: '{other}' conflicts with --session {session_reference}"
+                        ));
+                    }
+                    ExportPositionalKind::OutputPath => {
+                        return Err(format!(
+                            "unexpected export argument: {other}"
+                        ));
+                    }
+                }
             }
         }
     }
