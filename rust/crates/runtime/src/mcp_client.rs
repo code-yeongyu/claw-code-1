@@ -21,6 +21,9 @@ pub struct McpStdioTransport {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub tool_call_timeout_ms: Option<u64>,
+    /// Maximum time (ms) to wait for the MCP `initialize` handshake.
+    /// `None` means use the default startup deadline.
+    pub startup_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +82,7 @@ impl McpClientTransport {
                 args: config.args.clone(),
                 env: config.env.clone(),
                 tool_call_timeout_ms: config.tool_call_timeout_ms,
+                startup_timeout_ms: config.startup_timeout_ms,
             }),
             McpServerConfig::Sse(config) => Self::Sse(McpRemoteTransport {
                 url: config.url.clone(),
@@ -115,6 +119,14 @@ impl McpStdioTransport {
         self.tool_call_timeout_ms
             .unwrap_or(DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS)
     }
+
+    /// Resolved startup deadline for the `initialize` handshake.
+    /// Falls back to `crate::mcp_stdio::MCP_STARTUP_DEADLINE_MS`.
+    #[must_use]
+    pub fn resolved_startup_timeout_ms(&self) -> u64 {
+        self.startup_timeout_ms
+            .unwrap_or(crate::mcp_stdio::MCP_STARTUP_DEADLINE_MS)
+    }
 }
 
 impl McpClientAuth {
@@ -149,6 +161,7 @@ mod tests {
                 args: vec!["mcp-server".to_string()],
                 env: BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]),
                 tool_call_timeout_ms: Some(15_000),
+                startup_timeout_ms: None,
             }),
         };
 
