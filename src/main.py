@@ -203,13 +203,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+class _ArgparseError(Exception):
+    """#179: internal exception capturing argparse's real error message.
+
+    Subclassed ArgumentParser raises this instead of printing + exiting,
+    so JSON mode can preserve the actual error (e.g. 'the following arguments
+    are required: session_id') in the envelope.
+    """
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
 def _emit_parse_error_envelope(argv: list[str], message: str) -> None:
-    """#178: emit JSON envelope for argparse-level errors when --output-format json is requested.
+    """#178/#179: emit JSON envelope for argparse-level errors when --output-format json is requested.
 
     Pre-scans argv for --output-format json. If found, prints a parse-error envelope
     to stdout (per SCHEMAS.md 'error' envelope shape) instead of letting argparse
     dump help text to stderr. This preserves the JSON contract for claws that can't
     parse argparse usage messages.
+
+    #179 update: `message` now carries argparse's actual error text, not a generic
+    rejection string. Stderr is fully suppressed in JSON mode.
     """
     import json
     # Extract the attempted command (argv[0] is the first positional)
@@ -246,16 +261,35 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     parser = build_parser()
-    # #178: catch argparse errors and emit JSON envelope when --output-format json present
-    try:
-        args = parser.parse_args(argv)
-    except SystemExit as exc:
-        # argparse exits with SystemExit on error (code 2) or --help (code 0)
-        if exc.code != 0 and _wants_json_output(argv):
-            # Reconstruct a generic parse-error message
-            _emit_parse_error_envelope(argv, 'invalid command or argument (argparse rejection)')
+    json_mode = _wants_json_output(argv)
+    # #178/#179: capture argparse errors with real message and emit JSON envelope
+    # when --output-format json is requested. In JSON mode, stderr is silenced
+    # so claws only see the envelope on stdout.
+    if json_mode:
+        # Monkey-patch parser.error to raise instead of print+exit. This preserves
+        # the original error message text (e.g. 'argument X: invalid choice: ...').
+        original_error = parser.error
+        def _json_mode_error(message: str) -> None:
+            raise _ArgparseError(message)
+        parser.error = _json_mode_error  # type: ignore[method-assign]
+        # Also patch all subparsers
+        for action in parser._actions:
+            if hasattr(action, 'choices') and isinstance(action.choices, dict):
+                for subp in action.choices.values():
+                    subp.error = _json_mode_error  # type: ignore[method-assign]
+        try:
+            args = parser.parse_args(argv)
+        except _ArgparseError as err:
+            _emit_parse_error_envelope(argv, err.message)
             return 1
-        raise
+        except SystemExit as exc:
+            # Defensive: if argparse exits via some other path (e.g. --help in JSON mode)
+            if exc.code != 0:
+                _emit_parse_error_envelope(argv, 'argparse exited with non-zero code')
+                return 1
+            raise
+    else:
+        args = parser.parse_args(argv)
     manifest = build_port_manifest()
     if args.command == 'summary':
         print(QueryEnginePort(manifest).render_summary())

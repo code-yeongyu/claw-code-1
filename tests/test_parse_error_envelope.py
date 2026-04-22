@@ -157,3 +157,83 @@ class TestParseErrorSchemaCompliance:
         )
         envelope = json.loads(result.stdout)
         assert envelope['error']['retryable'] is False
+
+
+class TestParseErrorStderrHygiene:
+    """#179: JSON mode must fully suppress argparse stderr output.
+
+    Before #179: stderr leaked argparse usage + error text even when --output-format json.
+    After #179: stderr is silent; envelope carries the real error message verbatim.
+    """
+
+    def test_json_mode_stderr_is_silent_on_unknown_command(self) -> None:
+        """Unknown command in JSON mode: stderr empty."""
+        result = subprocess.run(
+            CLI + ['nonexistent-cmd', '--output-format', 'json'],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert result.stderr == '', (
+            f"JSON mode stderr must be empty; got:\n{result.stderr!r}"
+        )
+
+    def test_json_mode_stderr_is_silent_on_missing_arg(self) -> None:
+        """Missing required arg in JSON mode: stderr empty (no argparse usage leak)."""
+        result = subprocess.run(
+            CLI + ['load-session', '--output-format', 'json'],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert result.stderr == '', (
+            f"JSON mode stderr must be empty on missing arg; got:\n{result.stderr!r}"
+        )
+
+    def test_json_mode_envelope_carries_real_argparse_message(self) -> None:
+        """#179: envelope.error.message contains argparse's actual text, not generic rejection."""
+        result = subprocess.run(
+            CLI + ['load-session', '--output-format', 'json'],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        envelope = json.loads(result.stdout)
+        # Real argparse message: 'the following arguments are required: session_id'
+        msg = envelope['error']['message']
+        assert 'session_id' in msg, (
+            f"envelope.error.message must carry real argparse text mentioning missing arg; got: {msg!r}"
+        )
+        assert 'required' in msg.lower(), (
+            f"envelope.error.message must indicate what is required; got: {msg!r}"
+        )
+
+    def test_json_mode_envelope_carries_invalid_choice_details(self) -> None:
+        """#179: unknown command envelope includes valid-choice list from argparse."""
+        result = subprocess.run(
+            CLI + ['typo-command', '--output-format', 'json'],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        envelope = json.loads(result.stdout)
+        msg = envelope['error']['message']
+        assert 'invalid choice' in msg.lower(), (
+            f"envelope must mention 'invalid choice'; got: {msg!r}"
+        )
+        # Should include at least one valid command name for discoverability
+        assert 'bootstrap' in msg or 'summary' in msg, (
+            f"envelope must include valid choices for discoverability; got: {msg!r}"
+        )
+
+    def test_text_mode_stderr_preserved_on_unknown_command(self) -> None:
+        """Text mode: argparse stderr behavior unchanged (backward compat)."""
+        result = subprocess.run(
+            CLI + ['nonexistent-cmd'],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        # Text mode still dumps argparse help to stderr
+        assert 'invalid choice' in result.stderr
+        assert result.returncode == 2
