@@ -160,6 +160,7 @@ class PortRuntime:
         max_turns: int = 3,
         structured_output: bool = False,
         timeout_seconds: float | None = None,
+        continuation_prompt: str | None = None,
     ) -> list[TurnResult]:
         """Run a multi-turn engine loop with optional wall-clock deadline.
 
@@ -172,6 +173,15 @@ class PortRuntime:
                 budget is exhausted mid-turn, a synthetic TurnResult with
                 ``stop_reason='timeout'`` is appended and the loop exits.
                 ``None`` (default) preserves legacy unbounded behaviour.
+            continuation_prompt: What to send on turns after the first. When
+                ``None`` (default, #163), the loop stops after turn 0 and the
+                caller decides how to continue. When set, the same text is
+                submitted for every turn after the first, giving claws a clean
+                hook for structured follow-ups (e.g. ``"Continue."``, a
+                routing-planner instruction, or a tool-output cue). Previously
+                the loop silently appended ``" [turn N]"`` to the original
+                prompt, polluting the transcript with harness-generated
+                annotation the model had no way to interpret.
 
         Returns:
             A list of TurnResult objects. The final entry's ``stop_reason``
@@ -182,6 +192,12 @@ class PortRuntime:
         block the loop indefinitely with no cancellation path, forcing claws to
         rely on external watchdogs or OS-level kills. Callers can now enforce a
         deadline and receive a typed timeout signal instead.
+
+        #163: the old ``f'{prompt} [turn {turn + 1}]'`` suffix was never
+        interpreted by the engine or any system prompt. It looked like a real
+        user turn in ``mutable_messages`` and the transcript, making replay and
+        analysis fragile. Removed entirely; callers supply ``continuation_prompt``
+        for meaningful follow-ups or let the loop stop after turn 0.
         """
         engine = QueryEnginePort.from_workspace()
         engine.config = QueryEngineConfig(max_turns=max_turns, structured_output=structured_output)
@@ -195,7 +211,17 @@ class PortRuntime:
         executor = ThreadPoolExecutor(max_workers=1) if deadline is not None else None
         try:
             for turn in range(max_turns):
-                turn_prompt = prompt if turn == 0 else f'{prompt} [turn {turn + 1}]'
+                # #163: no more f'{prompt} [turn N]' suffix injection.
+                # On turn 0 submit the original prompt.
+                # On turn > 0, submit the caller-supplied continuation prompt;
+                # if the caller did not supply one, stop the loop cleanly instead
+                # of fabricating a fake user turn.
+                if turn == 0:
+                    turn_prompt = prompt
+                elif continuation_prompt is not None:
+                    turn_prompt = continuation_prompt
+                else:
+                    break
 
                 if deadline is None:
                     # Legacy path: unbounded call, preserves existing behaviour exactly.

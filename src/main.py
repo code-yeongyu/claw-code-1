@@ -71,6 +71,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help='total wall-clock budget across all turns (#161). Default: unbounded.',
     )
+    loop_parser.add_argument(
+        '--continuation-prompt',
+        default=None,
+        help=(
+            'prompt to submit on turns after the first (#163). Default: None '
+            '(loop stops after turn 0). Replaces the deprecated implicit "[turn N]" '
+            'suffix that used to pollute the transcript.'
+        ),
+    )
 
     flush_parser = subparsers.add_parser('flush-transcript', help='persist and flush a temporary session transcript')
     flush_parser.add_argument('prompt')
@@ -199,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
             max_turns=args.max_turns,
             structured_output=args.structured_output,
             timeout_seconds=args.timeout_seconds,
+            continuation_prompt=args.continuation_prompt,
         )
         for idx, result in enumerate(results, start=1):
             print(f'## Turn {idx}')

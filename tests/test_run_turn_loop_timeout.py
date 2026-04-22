@@ -74,7 +74,13 @@ class TestTimeoutAbortsHungTurn:
 
 class TestTimeoutBudgetIsTotal:
     def test_budget_is_cumulative_across_turns(self) -> None:
-        """timeout_seconds is total wall-clock across all turns, not per-turn."""
+        """timeout_seconds is total wall-clock across all turns, not per-turn.
+
+        #163 interaction: multi-turn behaviour now requires an explicit
+        ``continuation_prompt``; otherwise the loop stops after turn 0 and
+        the cumulative-budget contract is trivially satisfied. We supply one
+        here so the test actually exercises the cross-turn deadline.
+        """
         runtime = PortRuntime()
         call_count = {'n': 0}
 
@@ -91,7 +97,10 @@ class TestTimeoutBudgetIsTotal:
             # 0.6s budget, 0.4s per turn. First turn completes (~0.4s),
             # second turn times out before finishing.
             results = runtime.run_turn_loop(
-                'review MCP tool', max_turns=5, timeout_seconds=0.6
+                'review MCP tool',
+                max_turns=5,
+                timeout_seconds=0.6,
+                continuation_prompt='continue',
             )
             elapsed = time.monotonic() - start
 
