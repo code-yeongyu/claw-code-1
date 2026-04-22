@@ -2313,21 +2313,35 @@ fn check_install_source_health() -> DiagnosticCheck {
 
 fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
     let in_repo = context.project_root.is_some();
-    DiagnosticCheck::new(
-        "Workspace",
-        if in_repo {
-            DiagnosticLevel::Ok
-        } else {
-            DiagnosticLevel::Warn
-        },
-        if in_repo {
+    // #122b: detect broad cwd (home dir, filesystem root) — runtime commands
+    // (Prompt/REPL) refuse to run here without --allow-broad-cwd, but doctor
+    // previously reported "ok" regardless. Diagnostic must be at least as
+    // strict as runtime: downgrade to Warn and surface the condition.
+    let broad_cwd = detect_broad_cwd();
+    let (level, summary) = match (in_repo, &broad_cwd) {
+        (_, Some(path)) => (
+            DiagnosticLevel::Warn,
+            format!(
+                "current directory is a broad path ({}); Prompt/REPL will refuse to run here without --allow-broad-cwd",
+                path.display()
+            ),
+        ),
+        (true, None) => (
+            DiagnosticLevel::Ok,
             format!(
                 "project root detected on branch {}",
                 context.git_branch.as_deref().unwrap_or("unknown")
-            )
-        } else {
-            "current directory is not inside a git project".to_string()
-        },
+            ),
+        ),
+        (false, None) => (
+            DiagnosticLevel::Warn,
+            "current directory is not inside a git project".to_string(),
+        ),
+    };
+    DiagnosticCheck::new(
+        "Workspace",
+        level,
+        summary,
     )
     .with_details(vec![
         format!("Cwd              {}", context.cwd.display()),
@@ -13658,5 +13672,66 @@ mod dump_manifests_tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod doctor_broad_cwd_tests {
+    //! #122b regression tests: doctor's workspace check must surface broad-cwd
+    //! as a warning, matching runtime (Prompt/REPL) refuse-to-run behavior.
+    //! Without these, `claw doctor` in ~/ or / reports "ok" while `claw prompt`
+    //! in the same dir errors out — diagnostic deception.
+
+    use super::{check_workspace_health, render_diagnostic_check, StatusContext};
+    use std::path::PathBuf;
+
+    fn make_ctx(cwd: PathBuf, project_root: Option<PathBuf>) -> StatusContext {
+        use runtime::SandboxStatus;
+        StatusContext {
+            cwd,
+            session_path: None,
+            loaded_config_files: 0,
+            discovered_config_files: 0,
+            memory_file_count: 0,
+            project_root,
+            git_branch: None,
+            git_summary: super::parse_git_workspace_summary(None),
+            sandbox_status: SandboxStatus::default(),
+            config_load_error: None,
+        }
+    }
+
+    #[test]
+    fn workspace_check_in_project_dir_reports_ok() {
+        // #122b non-regression: non-broad project dir should stay OK.
+        let ctx = make_ctx(
+            PathBuf::from("/tmp/my-project"),
+            Some(PathBuf::from("/tmp/my-project")),
+        );
+        let check = check_workspace_health(&ctx);
+        // Use rendered output as the contract surface.
+        let rendered = render_diagnostic_check(&check);
+        assert!(rendered.contains("Status           ok"),
+            "project dir should be OK; got:\n{rendered}");
+    }
+
+    #[test]
+    fn workspace_check_outside_project_reports_warn() {
+        // #122b non-regression: non-broad, non-git dir stays as Warn with the
+        // "not inside a git project" summary.
+        let ctx = make_ctx(
+            PathBuf::from("/tmp/random-dir-not-project"),
+            None,
+        );
+        let check = check_workspace_health(&ctx);
+        let rendered = render_diagnostic_check(&check);
+        assert!(
+            rendered.contains("Status           warn"),
+            "non-git dir should warn; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("not inside a git project"),
+            "should report not-in-project; got:\n{rendered}"
+        );
     }
 }
